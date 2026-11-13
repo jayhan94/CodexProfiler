@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 const MAX_SESSIONS: usize = 32;
-const CACHE_VERSION: i64 = 3;
+const CACHE_VERSION: i64 = 6;
 const DETAILS_CHARS: usize = 32 * 1024;
 const CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -56,6 +56,14 @@ struct ThinPayload {
     id: Option<String>,
     cwd: Option<String>,
     model: Option<String>,
+    #[serde(
+        deserialize_with = "observed_tier",
+        skip_serializing_if = "Option::is_none"
+    )]
+    service_tier: Option<Option<String>>,
+    trigger: Option<String>,
+    settings: Option<ThinSettings>,
+    thread_settings: Option<ThinSettings>,
     source: Option<Value>,
     agent_role: Option<String>,
     agent_path: Option<String>,
@@ -84,6 +92,25 @@ struct ThinPayload {
     item: Option<ThinItem>,
 }
 
+// Missing tier is unknown; an explicit JSON null is a recorded reset to standard mode.
+fn observed_tier<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+// Settings are sampled from each recorded transition, never from today's global config.
+#[derive(Default, Deserialize, Serialize)]
+#[serde(default)]
+struct ThinSettings {
+    model: Option<String>,
+    #[serde(
+        deserialize_with = "observed_tier",
+        skip_serializing_if = "Option::is_none"
+    )]
+    service_tier: Option<Option<String>>,
+}
+
 #[derive(Default, Deserialize, Serialize)]
 #[serde(default)]
 struct ThinInfo {
@@ -93,6 +120,9 @@ struct ThinInfo {
 #[derive(Default, Deserialize, Serialize)]
 #[serde(default)]
 struct ThinUsage {
+    input_tokens: Option<u64>,
+    cached_input_tokens: Option<u64>,
+    cache_write_input_tokens: Option<u64>,
     output_tokens: Option<u64>,
 }
 
@@ -208,6 +238,7 @@ fn thin_record(line: &[u8]) -> std::result::Result<Option<Value>, serde_json::Er
     if !matches!(
         envelope.kind.as_str(),
         "session_meta"
+            | "compacted"
             | "turn_context"
             | "event_msg"
             | "response_item"
@@ -217,10 +248,11 @@ fn thin_record(line: &[u8]) -> std::result::Result<Option<Value>, serde_json::Er
     ) {
         return Ok(None);
     }
-    let Some(raw_payload) = envelope.payload else {
-        return Ok(None);
+    let mut payload: ThinPayload = match envelope.payload {
+        Some(raw_payload) => serde_json::from_str(raw_payload.get())?,
+        None if envelope.kind == "compacted" => ThinPayload::default(),
+        None => return Ok(None),
     };
-    let mut payload: ThinPayload = serde_json::from_str(raw_payload.get())?;
     if envelope.kind == "response_item"
         && !matches!(
             payload.kind.as_deref(),
@@ -273,7 +305,7 @@ impl Store {
         {
             // These tables are a reproducible cache; Codex source logs are never changed.
             db.execute_batch(
-                "BEGIN; DELETE FROM sources; DELETE FROM sessions; PRAGMA user_version=3; COMMIT;",
+                "BEGIN; DELETE FROM sources; DELETE FROM sessions; PRAGMA user_version=6; COMMIT;",
             )?;
         }
         let sessions = {
@@ -1006,5 +1038,123 @@ mod tests {
         assert_eq!(bound, "child");
         drop(store);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Cost accounting retains every reported usage count while missing counts remain unknown.
+    #[test]
+    fn full_usage_counts_survive_thin_parser() {
+        let counts = serde_json::json!({"input_tokens":1000,"cached_input_tokens":700,
+            "cache_write_input_tokens":100,"output_tokens":50});
+        let row = serde_json::json!({"type":"token_usage_record","payload":{
+            "thread_id":"chat","turn_id":"turn","response_id":"response",
+            "usage":counts,"turn_token_usage":counts,"thread_token_usage":counts}});
+        let reduced = thin_record(&serde_json::to_vec(&row).unwrap())
+            .unwrap()
+            .unwrap();
+        for field in ["usage", "turn_token_usage", "thread_token_usage"] {
+            assert_eq!(reduced["payload"][field], counts);
+        }
+        let hook = serde_json::json!({"type":"monitor_hook","payload":{
+            "thread_id":"chat","hook_event_name":"PostModelRequest","token_usage":counts}});
+        let hook = thin_record(&serde_json::to_vec(&hook).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(hook["payload"]["token_usage"], counts);
+        let partial = serde_json::json!({"type":"token_usage_record","payload":{
+            "usage":{"output_tokens":50}}});
+        let partial = thin_record(&serde_json::to_vec(&partial).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(partial["payload"]["usage"]["input_tokens"].is_null());
+        assert_eq!(partial["payload"]["usage"]["output_tokens"], 50);
+    }
+
+    /// Mid-turn speed changes retain their recorded tier rather than using current global settings.
+    #[test]
+    fn recorded_speed_settings_and_compaction_trigger_survive() {
+        let row = serde_json::json!({"type":"event_msg","timestamp_ms":2000,
+            "payload":{"type":"thread_settings_applied","turn_id":"turn-a",
+                "service_tier":"fast","settings":{"model":"gpt-6.1-sol","service_tier":"fast",
+                "instructions":"not copied"}}});
+        let reduced = thin_record(&serde_json::to_vec(&row).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(reduced["payload"]["service_tier"], "fast");
+        assert_eq!(reduced["payload"]["settings"]["service_tier"], "fast");
+        assert_eq!(reduced["payload"]["settings"]["model"], "gpt-6.1-sol");
+        assert!(reduced["payload"]["settings"].get("instructions").is_none());
+        let hook = serde_json::json!({"type":"monitor_hook","timestamp_ms":2100,
+            "payload":{"thread_id":"chat-a","turn_id":"turn-a","service_tier":"fast",
+                "hook_event_name":"PreCompact","trigger":"auto"}});
+        let hook = thin_record(&serde_json::to_vec(&hook).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(hook["payload"]["trigger"], "auto");
+        assert_eq!(hook["payload"]["service_tier"], "fast");
+    }
+
+    /// Compaction markers remain observable while replacement history and summary bodies are skipped.
+    #[test]
+    fn compaction_marker_discards_summary_body() {
+        let row = serde_json::json!({"type":"compacted","timestamp_ms":3000,
+            "payload":{"turn_id":"turn-a","message":"x".repeat(1024*1024),
+                "replacement_history":[{"content":"not copied"}],"trigger":"manual"}});
+        let reduced = thin_record(&serde_json::to_vec(&row).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(reduced["type"], "compacted");
+        assert_eq!(reduced["timestamp_ms"], 3000);
+        assert_eq!(reduced["payload"]["trigger"], "manual");
+        assert_eq!(reduced["payload"]["turn_id"], "turn-a");
+        assert!(reduced["payload"].get("message").is_none());
+        assert!(reduced["payload"].get("replacement_history").is_none());
+        assert!(serde_json::to_vec(&reduced).unwrap().len() < 2048);
+        let marker = thin_record(br#"{"type":"compacted","timestamp_ms":3100}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(marker["type"], "compacted");
+    }
+
+    /// Real desktop settings use thread_settings; missing tier differs from explicit null reset.
+    #[test]
+    fn actual_thread_settings_preserve_tier_presence() {
+        let record = |payload: Value| {
+            thin_record(
+                &serde_json::to_vec(&serde_json::json!({"type":"event_msg",
+                "timestamp_ms":2000,"payload":payload}))
+                .unwrap(),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let fast = record(
+            serde_json::json!({"type":"thread_settings_applied","thread_id":"chat-a",
+            "thread_settings":{"model":"gpt-6.1-sol","model_provider_id":"openai","service_tier":"priority"}}),
+        );
+        assert_eq!(
+            fast["payload"]["thread_settings"]["service_tier"],
+            "priority"
+        );
+        assert_eq!(fast["payload"]["thread_settings"]["model"], "gpt-6.1-sol");
+        assert!(fast["payload"].get("service_tier").is_none());
+        let off = record(serde_json::json!({"type":"thread_settings_applied",
+            "thread_settings":{"service_tier":null}}));
+        assert_eq!(
+            off["payload"]["thread_settings"].get("service_tier"),
+            Some(&Value::Null)
+        );
+        let missing = record(serde_json::json!({"type":"thread_settings_applied",
+            "thread_settings":{"model":"gpt-6.1-sol"}}));
+        assert!(missing["payload"]["thread_settings"]
+            .get("service_tier")
+            .is_none());
+        let context = thin_record(br#"{"type":"turn_context","payload":{"model":"gpt-6.1-sol"}}"#)
+            .unwrap()
+            .unwrap();
+        assert!(context["payload"].get("service_tier").is_none());
+        let explicit = thin_record(br#"{"type":"monitor_hook","payload":{"service_tier":null}}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(explicit["payload"].get("service_tier"), Some(&Value::Null));
     }
 }

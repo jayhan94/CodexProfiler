@@ -3,6 +3,8 @@
 mod collector;
 mod hook;
 mod model;
+mod pricing;
+mod theme;
 mod ui;
 
 use eframe::egui;
@@ -77,6 +79,10 @@ fn headless(options: Options, seconds: u64) {
                     "title": session.title,
                     "is_internal": session.is_internal,
                     "requests": session.requests.len(),
+                    "cost_usd": session.cost.total(),
+                    "priced_requests": session.cost.priced_requests,
+                    "unpriced_requests": session.cost.unpriced_requests,
+                    "service_tier": session.service_tier,
                     "commands_with_details": session.tools.iter().filter(|t| !t.details.is_empty()).count(),
                     "turn_id": session.turn_id,
                     "output_tokens": session.output_tokens,
@@ -113,7 +119,7 @@ fn main() -> eframe::Result<()> {
     });
     if args.iter().any(|arg| arg == "--hook") {
         if let Err(error) = hook::emit(&options.codex_home) {
-            eprintln!("Codex monitor hook: {error}");
+            eprintln!("CodexProfiler hook: {error}");
             std::process::exit(1);
         }
         return Ok(());
@@ -135,7 +141,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "Codex Monitor",
+        "CodexProfiler",
         native,
         Box::new(move |context| {
             Ok(Box::new(ui::Monitor::new(
@@ -149,10 +155,10 @@ fn main() -> eframe::Result<()> {
 
 fn print_help() {
     println!(
-        "Codex Monitor\n\
-Usage: codex-monitor [--codex-home PATH] [--db PATH] [--headless-seconds N]\n\
-       codex-monitor --print-hooks [--codex-home PATH]\n\
-       codex-monitor --hook [--codex-home PATH]\n\n\
+        "CodexProfiler\n\
+Usage: codex-profiler [--codex-home PATH] [--db PATH] [--headless-seconds N]\n\
+       codex-profiler --print-hooks [--codex-home PATH]\n\
+       codex-profiler --hook [--codex-home PATH]\n\n\
 The default source is CODEX_HOME or USERPROFILE/HOME/.codex.\n\
 The default SQLite cache is data/monitor.sqlite beside this executable.\n\
 --print-hooks prints optional command hook configuration; it does not install it.\n\

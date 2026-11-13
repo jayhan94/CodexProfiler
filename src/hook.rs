@@ -21,8 +21,21 @@ struct HookInput {
     token_usage: Option<Value>,
     status: Option<String>,
     response_id: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "present_tier",
+        skip_serializing_if = "Option::is_none"
+    )]
+    service_tier: Option<Value>,
+    trigger: Option<String>,
     #[serde(default, deserialize_with = "limited_input")]
     tool_input: Option<Value>,
+}
+
+fn present_tier<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
 }
 
 // Tool arguments are useful diagnostics, while outputs and prompts remain excluded.
@@ -153,5 +166,24 @@ mod tests {
     fn session_id_is_not_an_identity_fallback() {
         let input = json!({"hook_event_name":"Stop", "session_id":"parent"});
         assert!(serde_json::from_value::<HookInput>(input).is_err());
+    }
+
+    // Hook emitters preserve an explicit tier clear while keeping an absent tier absent.
+    #[test]
+    fn optional_tier_preserves_presence() {
+        let base = json!({"transcript_path":"log","hook_event_name":"PreModelRequest"});
+        let missing: HookInput = serde_json::from_value(base.clone()).unwrap();
+        assert!(serde_json::to_value(missing)
+            .unwrap()
+            .get("service_tier")
+            .is_none());
+        let mut clear = base;
+        clear["service_tier"] = Value::Null;
+        let explicit: HookInput = serde_json::from_value(clear).unwrap();
+        assert!(serde_json::to_value(explicit)
+            .unwrap()
+            .get("service_tier")
+            .unwrap()
+            .is_null());
     }
 }

@@ -18,6 +18,14 @@ pub struct Session {
     pub is_internal: bool,
     pub parent_id: String,
     pub model: String,
+    #[serde(default = "standard_tier")]
+    pub service_tier: String,
+    #[serde(default = "assumed_tier_source")]
+    pub service_tier_source: String,
+    pub tier_history: Vec<(i64, String, String)>,
+    pub service_tier_updated_ms: i64,
+    pub compactions: Vec<Compaction>,
+    pub active_compaction: Option<String>,
     pub phase: String,
     pub turn_id: String,
     pub started_ms: Option<i64>,
@@ -27,6 +35,10 @@ pub struct Session {
     pub request_tps: Option<f64>,
     pub tools: Vec<Tool>,
     pub requests: Vec<ModelRequest>,
+    pub cost: CostSummary,
+    pub billing_seen: Vec<String>,
+    pub billing_quotes: Vec<BillingQuote>,
+    pub billing_models: Vec<(String, String)>,
     pub request_started_ms: Option<i64>,
     pub usage_total: u64,
     pub turn_base: u64,
@@ -42,6 +54,7 @@ pub struct Tool {
     pub id: String,
     pub name: String,
     pub details: String,
+    pub compaction_id: Option<String>,
     pub started_ms: i64,
     pub ended_ms: Option<i64>,
     pub status: String,
@@ -52,11 +65,77 @@ pub struct Tool {
 pub struct ModelRequest {
     pub id: String,
     pub model: String,
+    #[serde(default = "standard_tier")]
+    pub service_tier: String,
+    #[serde(default = "assumed_tier_source")]
+    pub service_tier_source: String,
+    pub compaction_id: Option<String>,
     pub started_ms: Option<i64>,
     pub ended_ms: Option<i64>,
     pub output_tokens: Option<u64>,
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub cache_write_input_tokens: Option<u64>,
+    pub cost_usd: Option<f64>,
     pub status: String,
     pub source: String,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Compaction {
+    pub id: String,
+    pub started_ms: Option<i64>,
+    pub ended_ms: Option<i64>,
+    pub trigger: String,
+    pub status: String,
+    pub hook_pending: bool,
+}
+
+fn standard_tier() -> String {
+    "standard".into()
+}
+fn assumed_tier_source() -> String {
+    "assumed".into()
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BillingQuote {
+    response_id: String,
+    turn_id: String,
+    timestamp_ms: i64,
+    request_started_ms: Option<i64>,
+    model: String,
+    tier: String,
+    tier_source: String,
+    input: Option<u64>,
+    cached: Option<u64>,
+    written: Option<u64>,
+    output: Option<u64>,
+    price: Option<crate::pricing::CostBreakdown>,
+}
+
+/// Canonical observed request costs across every turn; input includes cache subsets.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CostSummary {
+    pub uncached_usd: f64,
+    pub cached_usd: f64,
+    pub write_usd: f64,
+    pub output_usd: f64,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
+    pub output_tokens: u64,
+    pub priced_requests: u64,
+    pub unpriced_requests: u64,
+}
+
+impl CostSummary {
+    pub fn total(&self) -> f64 {
+        self.uncached_usd + self.cached_usd + self.write_usd + self.output_usd
+    }
 }
 
 pub fn now_ms() -> i64 {
@@ -84,6 +163,12 @@ fn timestamp(row: &Value) -> i64 {
 pub fn apply(s: &mut Session, row: &Value) {
     let p = &row["payload"];
     let ts = timestamp(row);
+    // Billing follows canonical response ownership, independently of the displayed latest turn.
+    remember_billing_model(s, row);
+    observe_service_tier(s, row, ts);
+    if row["type"] == "token_usage_record" {
+        account_usage(s, p, ts);
+    }
     if ts > 0 && ts < s.last_ms {
         // Multiple sources can deliver boundaries late; retain timing without rewinding status.
         let same_turn = p["turn_id"].as_str() == Some(s.turn_id.as_str());
@@ -98,6 +183,8 @@ pub fn apply(s: &mut Session, row: &Value) {
             event(s, p, ts);
         } else if same_turn && row["type"] == "token_usage_record" {
             usage(s, p, ts);
+        } else if row["type"] == "compacted" && s.started_ms.is_some_and(|start| ts >= start) {
+            compaction_end(s, p, ts, false);
         }
         trim_tools(s);
         return;
@@ -115,17 +202,277 @@ pub fn apply(s: &mut Session, row: &Value) {
         "response_item" => response(s, p, ts),
         "token_usage_record" => usage(s, p, ts),
         "hook_event" | "monitor_hook" => hook(s, p, ts),
+        "compacted" => compaction_end(s, p, ts, false),
         _ => {}
     }
     trim_tools(s);
 }
 
 fn trim_tools(s: &mut Session) {
+    if s.compactions.len() > 50 {
+        s.compactions.drain(..s.compactions.len() - 50);
+    }
     if s.requests.len() > 100 {
         s.requests.drain(..s.requests.len() - 100);
     }
     if s.tools.len() > 100 {
         s.tools.drain(..s.tools.len() - 100);
+    }
+}
+
+/// Observe only explicit tier fields. Missing tier metadata never turns Fast off.
+fn observe_service_tier(s: &mut Session, row: &Value, ts: i64) {
+    if s.service_tier.is_empty() {
+        s.service_tier = standard_tier();
+        s.service_tier_source = assumed_tier_source();
+    }
+    let p = &row["payload"];
+    let mut reported = None;
+    if p["type"] == "thread_settings_applied" {
+        if let Some(settings) = p["thread_settings"].as_object() {
+            if let Some(value) = settings.get("service_tier") {
+                reported = Some(value);
+            }
+        }
+    }
+    if row["type"] == "turn_context" {
+        if let Some(value) = p.get("service_tier") {
+            reported = Some(value);
+        }
+    }
+    let Some(value) = reported else {
+        return;
+    };
+    let tier = value.as_str().unwrap_or("standard").to_lowercase();
+    let mut changed = false;
+    if !s
+        .tier_history
+        .iter()
+        .any(|(time, old, _)| *time == ts && old == &tier)
+    {
+        changed = true;
+        s.tier_history.push((ts, tier.clone(), "settings".into()));
+        s.tier_history.sort_by_key(|(time, _, _)| *time);
+        if s.tier_history.len() > 512 {
+            s.tier_history.remove(0);
+        }
+    }
+    if ts >= s.service_tier_updated_ms {
+        s.service_tier = tier;
+        s.service_tier_source = "reported".into();
+        s.service_tier_updated_ms = ts;
+    }
+    if changed {
+        reconcile_service_history(s);
+    }
+}
+
+fn tier_at(s: &Session, ts: i64) -> (String, String) {
+    s.tier_history
+        .iter()
+        .rev()
+        .find(|(time, _, _)| *time <= ts)
+        .map(|(_, tier, source)| (tier.clone(), source.clone()))
+        .unwrap_or_else(|| (standard_tier(), assumed_tier_source()))
+}
+
+fn request_tier(s: &Session, p: &Value, ts: i64) -> (String, String) {
+    if let Some(value) = p.get("service_tier") {
+        return (
+            value.as_str().unwrap_or("standard").to_lowercase(),
+            "request".into(),
+        );
+    }
+    tier_at(s, ts)
+}
+
+/// Chunked sources may deliver settings late; re-evaluate inferred tiers at each observed start.
+fn reconcile_service_history(s: &mut Session) {
+    for index in 0..s.requests.len() {
+        let request = &s.requests[index];
+        if matches!(request.service_tier_source.as_str(), "request" | "response") {
+            continue;
+        }
+        let Some(start) = request.started_ms else {
+            continue;
+        };
+        let (tier, source) = tier_at(s, start);
+        s.requests[index].service_tier = tier;
+        s.requests[index].service_tier_source = source;
+        fill_request_cost(&mut s.requests[index], &Value::Null);
+        reconcile_request_bill(s, index);
+    }
+    // The ledger outlives the visible request buffer, so older observed starts remain correctable.
+    for index in 0..s.billing_quotes.len() {
+        let mut quote = s.billing_quotes[index].clone();
+        if matches!(quote.tier_source.as_str(), "request" | "response") {
+            continue;
+        }
+        let (tier, source) = tier_at(s, quote.request_started_ms.unwrap_or(quote.timestamp_ms));
+        if quote.tier == tier && quote.tier_source == source {
+            continue;
+        }
+        let old = quote.price;
+        quote.tier = tier;
+        quote.tier_source = source;
+        quote.price = quote_price(&quote);
+        adjust_quote_total(&mut s.cost, old, quote.price);
+        s.billing_quotes[index] = quote;
+    }
+}
+
+/// A request's start snapshot takes precedence over a later session setting.
+fn usage_tier(s: &Session, p: &Value, ts: i64) -> (String, String) {
+    if let Some(tier) = p["service_tier"].as_str() {
+        return (tier.to_lowercase(), "response".into());
+    }
+    let id = p["response_id"].as_str();
+    if let Some(r) = s.requests.iter().find(|r| Some(r.id.as_str()) == id) {
+        return (r.service_tier.clone(), r.service_tier_source.clone());
+    }
+    let candidates: Vec<_> = s
+        .requests
+        .iter()
+        .filter(|r| {
+            r.source != "usage"
+                && r.started_ms.is_some_and(|start| ts >= start)
+                && r.ended_ms.is_none_or(|end| ts <= end)
+        })
+        .collect();
+    if candidates.len() == 1 {
+        return (
+            candidates[0].service_tier.clone(),
+            candidates[0].service_tier_source.clone(),
+        );
+    }
+    tier_at(s, ts)
+}
+
+fn usage_start(s: &Session, p: &Value, ts: i64) -> Option<i64> {
+    let id = p["response_id"].as_str();
+    if let Some(request) = s.requests.iter().find(|r| Some(r.id.as_str()) == id) {
+        return request.started_ms;
+    }
+    let candidates: Vec<_> = s
+        .requests
+        .iter()
+        .filter(|r| {
+            r.source != "usage"
+                && r.started_ms.is_some_and(|start| ts >= start)
+                && r.ended_ms.is_none_or(|end| ts <= end)
+        })
+        .collect();
+    if candidates.len() == 1 {
+        candidates[0].started_ms
+    } else {
+        None
+    }
+}
+
+/// Membership uses observed starts and intervals; end-only compaction does not invent children.
+fn compaction_at(s: &Session, ts: i64) -> Option<String> {
+    s.compactions
+        .iter()
+        .rev()
+        .find(|c| {
+            c.started_ms.is_some_and(|start| ts >= start) && c.ended_ms.is_none_or(|end| ts <= end)
+        })
+        .map(|c| c.id.clone())
+}
+
+fn compaction_start(s: &mut Session, p: &Value, ts: i64) {
+    let id = format!("compact:{ts}");
+    if s.compactions.iter().any(|c| c.id == id) {
+        return;
+    }
+    s.compactions.push(Compaction {
+        id: id.clone(),
+        started_ms: Some(ts),
+        trigger: p["trigger"].as_str().unwrap_or("unknown").into(),
+        status: "进行中".into(),
+        hook_pending: true,
+        ..Compaction::default()
+    });
+    s.active_compaction = Some(id);
+    s.phase = "正在压缩上下文".into();
+}
+
+fn compaction_end(s: &mut Session, p: &Value, ts: i64, from_hook: bool) {
+    let index = s
+        .active_compaction
+        .as_ref()
+        .and_then(|id| s.compactions.iter().position(|c| &c.id == id))
+        .or_else(|| {
+            if from_hook {
+                s.compactions.iter().rposition(|c| c.hook_pending)
+            } else {
+                s.compactions.iter().position(|c| {
+                    c.started_ms.is_some_and(|start| ts >= start)
+                        && c.ended_ms.is_some_and(|end| ts <= end)
+                })
+            }
+        });
+    if let Some(index) = index {
+        let c = &mut s.compactions[index];
+        if from_hook || c.ended_ms.is_none() {
+            c.ended_ms = Some(ts);
+        }
+        c.status = "已完成".into();
+        if from_hook {
+            c.hook_pending = false;
+        }
+        if let Some(trigger) = p["trigger"].as_str() {
+            c.trigger = trigger.into();
+        }
+        let id = c.id.clone();
+        reconcile_compaction(s, &id);
+    } else {
+        let id = format!("compact:end:{ts}");
+        if !s.compactions.iter().any(|c| c.id == id) {
+            s.compactions.push(Compaction {
+                id,
+                ended_ms: Some(ts),
+                trigger: p["trigger"].as_str().unwrap_or("unknown").into(),
+                status: "已完成（开始时间未知）".into(),
+                ..Compaction::default()
+            });
+        }
+    }
+    s.active_compaction = None;
+    s.phase = "上下文压缩完成 / 等待后续事件".into();
+}
+
+/// A complete hook interval can reconcile a prior log-only completion and its child observations.
+fn reconcile_compaction(s: &mut Session, id: &str) {
+    let Some(c) = s.compactions.iter().find(|c| c.id == id) else {
+        return;
+    };
+    let Some((start, end)) = c.started_ms.zip(c.ended_ms) else {
+        return;
+    };
+    let candidates: Vec<_> = s
+        .compactions
+        .iter()
+        .filter(|c| {
+            c.started_ms.is_none() && c.ended_ms.is_some_and(|time| time >= start && time <= end)
+        })
+        .map(|c| c.id.clone())
+        .collect();
+    if candidates.len() == 1 {
+        s.compactions.retain(|c| c.id != candidates[0]);
+    }
+    for tool in &mut s.tools {
+        if tool.compaction_id.is_none() && tool.started_ms >= start && tool.started_ms <= end {
+            tool.compaction_id = Some(id.into());
+        }
+    }
+    for request in &mut s.requests {
+        let observed = request.started_ms.or(request.ended_ms);
+        if request.compaction_id.is_none()
+            && observed.is_some_and(|time| time >= start && time <= end)
+        {
+            request.compaction_id = Some(id.into());
+        }
     }
 }
 
@@ -147,6 +494,8 @@ fn begin(s: &mut Session, id: String, ts: i64) {
     s.record_tokens = 0;
     s.tools.clear();
     s.requests.clear();
+    s.compactions.clear();
+    s.active_compaction = None;
     s.phase = "等待后续事件（模型/网络状态未知）".into();
 }
 
@@ -196,6 +545,7 @@ fn response(s: &mut Session, p: &Value, ts: i64) {
                     id: text(p, "call_id"),
                     name: text(p, "name"),
                     details: call_details(p),
+                    compaction_id: compaction_at(s, ts),
                     started_ms: ts,
                     status: "调用已发出".into(),
                     ..Tool::default()
@@ -224,7 +574,11 @@ fn upsert_tool(s: &mut Session, tool: Tool) {
             return;
         }
         let previous = t.details.clone();
+        let compaction = t.compaction_id.clone();
         *t = tool;
+        if t.compaction_id.is_none() {
+            t.compaction_id = compaction;
+        }
         if t.details.is_empty() {
             t.details = previous;
         }
@@ -261,6 +615,10 @@ fn command_summary(value: &Value) -> String {
 fn completed_item(s: &mut Session, p: &Value, ts: i64) {
     let i = &p["item"];
     let kind = i["type"].as_str().unwrap_or_default();
+    if kind == "ContextCompaction" {
+        compaction_end(s, p, ts, false);
+        return;
+    }
     if kind == "UserMessage" && s.title.is_empty() {
         if let Some(a) = i["content"].as_array() {
             if let Some(t) = a
@@ -286,6 +644,7 @@ fn completed_item(s: &mut Session, p: &Value, ts: i64) {
             Tool {
                 id: text(i, "id"),
                 name,
+                compaction_id: compaction_at(s, start),
                 details: if kind == "CommandExecution" {
                     detail(&i["command"])
                 } else {
@@ -302,6 +661,224 @@ fn completed_item(s: &mut Session, p: &Value, ts: i64) {
             },
         );
     }
+}
+
+/// Keep a bounded model lookup so late usage cannot inherit a newer turn's model.
+fn remember_billing_model(s: &mut Session, row: &Value) {
+    if row["type"] != "turn_context" {
+        return;
+    }
+    let p = &row["payload"];
+    let (Some(turn), Some(model)) = (p["turn_id"].as_str(), p["model"].as_str()) else {
+        return;
+    };
+    if let Some(entry) = s.billing_models.iter_mut().find(|(id, _)| id == turn) {
+        entry.1 = model.into();
+    } else {
+        s.billing_models.push((turn.into(), model.into()));
+        if s.billing_models.len() > 512 {
+            s.billing_models.remove(0);
+        }
+    }
+}
+
+fn usage_model<'a>(s: &'a Session, p: &'a Value) -> &'a str {
+    if let Some(model) = p["model"].as_str() {
+        return model;
+    }
+    let turn = p["turn_id"].as_str().unwrap_or_default();
+    s.billing_models
+        .iter()
+        .rev()
+        .find(|(id, _)| id == turn)
+        .map(|(_, model)| model.as_str())
+        .unwrap_or_else(|| if turn == s.turn_id { &s.model } else { "" })
+}
+
+/// Source cursors guarantee replay continuity; this recent-ID guard also rejects duplicate records.
+fn account_usage(s: &mut Session, p: &Value, ts: i64) {
+    if p["thread_id"]
+        .as_str()
+        .is_some_and(|owner| !s.id.is_empty() && owner != s.id)
+    {
+        return;
+    }
+    let Some(id) = p["response_id"].as_str().filter(|id| !id.is_empty()) else {
+        return;
+    };
+    if s.billing_seen.iter().any(|seen| seen == id) {
+        return;
+    }
+    s.billing_seen.push(id.into());
+    if s.billing_seen.len() > 2048 {
+        s.billing_seen.remove(0);
+    }
+    let usage = &p["usage"];
+    let input = usage["input_tokens"].as_u64();
+    let output = usage["output_tokens"].as_u64();
+    let cached = usage["cached_input_tokens"].as_u64();
+    let written = usage["cache_write_input_tokens"].as_u64();
+    s.cost.input_tokens = s.cost.input_tokens.saturating_add(input.unwrap_or(0));
+    s.cost.cached_input_tokens = s
+        .cost
+        .cached_input_tokens
+        .saturating_add(cached.unwrap_or(0));
+    s.cost.cache_write_input_tokens = s
+        .cost
+        .cache_write_input_tokens
+        .saturating_add(written.unwrap_or(0));
+    s.cost.output_tokens = s.cost.output_tokens.saturating_add(output.unwrap_or(0));
+    let (tier, tier_source) = usage_tier(s, p, ts);
+    let mut quote = BillingQuote {
+        response_id: id.into(),
+        turn_id: text(p, "turn_id"),
+        timestamp_ms: ts,
+        request_started_ms: usage_start(s, p, ts),
+        model: usage_model(s, p).into(),
+        tier,
+        tier_source,
+        input,
+        cached,
+        written,
+        output,
+        price: None,
+    };
+    let priced = quote_price(&quote);
+    quote.price = priced;
+    s.billing_quotes.push(quote);
+    if s.billing_quotes.len() > 2048 {
+        s.billing_quotes.remove(0);
+    }
+    if let Some(price) = priced {
+        s.cost.uncached_usd += price.uncached_usd;
+        s.cost.cached_usd += price.cached_usd;
+        s.cost.write_usd += price.write_usd;
+        s.cost.output_usd += price.output_usd;
+        s.cost.priced_requests += 1;
+    } else {
+        s.cost.unpriced_requests += 1;
+    }
+}
+
+fn quote_price(quote: &BillingQuote) -> Option<crate::pricing::CostBreakdown> {
+    let (input, output) = quote.input.zip(quote.output)?;
+    let (cached, written) = quote.cached.zip(quote.written)?;
+    crate::pricing::request_for_tier(&quote.model, input, cached, written, output, &quote.tier)
+}
+
+/// Correct an earlier assumption once the same response acquires an observed request start.
+fn reconcile_request_bill(s: &mut Session, index: usize) {
+    let request = &s.requests[index];
+    let Some(start) = request.started_ms else {
+        return;
+    };
+    let Some(end) = request.ended_ms else {
+        return;
+    };
+    let direct = s
+        .billing_quotes
+        .iter()
+        .position(|q| q.response_id == request.id);
+    let matches: Vec<_> = s
+        .billing_quotes
+        .iter()
+        .enumerate()
+        .filter(|(_, q)| q.turn_id == s.turn_id && q.timestamp_ms >= start && q.timestamp_ms <= end)
+        .map(|(i, _)| i)
+        .collect();
+    let Some(billing) = direct.or_else(|| {
+        if matches.len() == 1 {
+            Some(matches[0])
+        } else {
+            None
+        }
+    }) else {
+        return;
+    };
+    let mut quote = s.billing_quotes[billing].clone();
+    quote.request_started_ms = Some(start);
+    let r = &mut s.requests[index];
+    r.id = quote.response_id.clone();
+    r.input_tokens = quote.input.or(r.input_tokens);
+    r.cached_input_tokens = quote.cached.or(r.cached_input_tokens);
+    r.cache_write_input_tokens = quote.written.or(r.cache_write_input_tokens);
+    r.output_tokens = quote.output.or(r.output_tokens);
+    fill_request_cost(r, &Value::Null);
+    if r.service_tier_source == "assumed"
+        || matches!(quote.tier_source.as_str(), "request" | "response")
+    {
+        s.billing_quotes[billing] = quote;
+        return;
+    }
+    let old = quote.price;
+    quote.tier = r.service_tier.clone();
+    quote.tier_source = r.service_tier_source.clone();
+    if !r.model.is_empty() {
+        quote.model = r.model.clone();
+    }
+    quote.price = quote_price(&quote);
+    adjust_quote_total(&mut s.cost, old, quote.price);
+    s.billing_quotes[billing] = quote;
+}
+
+fn adjust_quote_total(
+    cost: &mut CostSummary,
+    old: Option<crate::pricing::CostBreakdown>,
+    new: Option<crate::pricing::CostBreakdown>,
+) {
+    if let Some(price) = old {
+        cost.uncached_usd -= price.uncached_usd;
+        cost.cached_usd -= price.cached_usd;
+        cost.write_usd -= price.write_usd;
+        cost.output_usd -= price.output_usd;
+        cost.priced_requests = cost.priced_requests.saturating_sub(1);
+    } else {
+        cost.unpriced_requests = cost.unpriced_requests.saturating_sub(1);
+    }
+    if let Some(price) = new {
+        cost.uncached_usd += price.uncached_usd;
+        cost.cached_usd += price.cached_usd;
+        cost.write_usd += price.write_usd;
+        cost.output_usd += price.output_usd;
+        cost.priced_requests += 1;
+    } else {
+        cost.unpriced_requests += 1;
+    }
+}
+
+/// Request details may be enriched by hooks; session cost only uses canonical usage records.
+fn fill_request_cost(request: &mut ModelRequest, usage: &Value) {
+    request.input_tokens = usage["input_tokens"].as_u64().or(request.input_tokens);
+    request.cached_input_tokens = usage["cached_input_tokens"]
+        .as_u64()
+        .or(request.cached_input_tokens);
+    request.cache_write_input_tokens = usage["cache_write_input_tokens"]
+        .as_u64()
+        .or(request.cache_write_input_tokens);
+    request.output_tokens = usage["output_tokens"].as_u64().or(request.output_tokens);
+    request.cost_usd = request
+        .input_tokens
+        .zip(request.output_tokens)
+        .zip(
+            request
+                .cached_input_tokens
+                .zip(request.cache_write_input_tokens),
+        )
+        .and_then(|((input, output), (cached, written))| {
+            crate::pricing::request_for_tier(
+                &request.model,
+                input,
+                cached,
+                written,
+                output,
+                if request.service_tier.is_empty() {
+                    "standard"
+                } else {
+                    &request.service_tier
+                },
+            )
+            .map(|cost| cost.total())
+        });
 }
 
 // Cumulative per-turn usage is authoritative; response IDs deduplicate older formats.
@@ -369,6 +946,7 @@ fn hook(s: &mut Session, p: &Value, ts: i64) {
                     id: text(p, "tool_use_id"),
                     name: text(p, "tool_name"),
                     details: detail(&p["tool_input"]),
+                    compaction_id: compaction_at(s, ts),
                     started_ms: ts,
                     status: "工具执行中".into(),
                     ..Tool::default()
@@ -382,6 +960,8 @@ fn hook(s: &mut Session, p: &Value, ts: i64) {
             }
         }
         "PermissionRequest" => s.phase = "等待批准".into(),
+        "PreCompact" => compaction_start(s, p, ts),
+        "PostCompact" => compaction_end(s, p, ts, true),
         "Stop" | "Interrupt" => {
             s.ended_ms = Some(ts);
             s.phase = "已结束".into();
@@ -462,7 +1042,8 @@ fn request_usage(s: &mut Session, p: &Value, ts: i64) {
     };
     let tokens = p["usage"]["output_tokens"].as_u64();
     if let Some(index) = s.requests.iter().position(|r| r.id == id) {
-        s.requests[index].output_tokens = tokens.or(s.requests[index].output_tokens);
+        fill_request_cost(&mut s.requests[index], &p["usage"]);
+        reconcile_request_bill(s, index);
         refresh_latest_tps(s, index);
         return;
     }
@@ -481,18 +1062,25 @@ fn request_usage(s: &mut Session, p: &Value, ts: i64) {
         let r = &mut s.requests[matches[0]];
         r.id = id.into();
         r.source = "hook+usage".into();
-        r.output_tokens = tokens.or(r.output_tokens);
+        fill_request_cost(r, &p["usage"]);
+        reconcile_request_bill(s, matches[0]);
         refresh_latest_tps(s, matches[0]);
     } else {
+        let (tier, tier_source) = usage_tier(s, p, ts);
         s.requests.push(ModelRequest {
             id: id.into(),
-            model: s.model.clone(),
+            model: usage_model(s, p).to_owned(),
+            service_tier: tier,
+            service_tier_source: tier_source,
+            compaction_id: compaction_at(s, ts),
             ended_ms: Some(ts),
             output_tokens: tokens,
             status: "已完成（开始时间未知）".into(),
             source: "usage".into(),
             ..ModelRequest::default()
         });
+        let last = s.requests.len() - 1;
+        fill_request_cost(&mut s.requests[last], &p["usage"]);
     }
 }
 
@@ -534,6 +1122,14 @@ fn merge_request_usage(s: &mut Session, index: usize) -> usize {
         s.requests[target].source = "hook+usage".into();
         s.requests[target].output_tokens =
             source.output_tokens.or(s.requests[target].output_tokens);
+        s.requests[target].input_tokens = source.input_tokens.or(s.requests[target].input_tokens);
+        s.requests[target].cached_input_tokens = source
+            .cached_input_tokens
+            .or(s.requests[target].cached_input_tokens);
+        s.requests[target].cache_write_input_tokens = source
+            .cache_write_input_tokens
+            .or(s.requests[target].cache_write_input_tokens);
+        fill_request_cost(&mut s.requests[target], &Value::Null);
         return target;
     }
     index
@@ -571,6 +1167,9 @@ fn model_hook(s: &mut Session, p: &Value, ts: i64, name: &str) {
         s.requests.push(ModelRequest {
             id: format!("hook:{ts}"),
             model: s.model.clone(),
+            service_tier: request_tier(s, p, ts).0,
+            service_tier_source: request_tier(s, p, ts).1,
+            compaction_id: compaction_at(s, ts),
             started_ms: Some(ts),
             status: "进行中".into(),
             source: "hook".into(),
@@ -584,9 +1183,27 @@ fn model_hook(s: &mut Session, p: &Value, ts: i64, name: &str) {
         .is_none_or(|status| status == "completed");
     let start = s.request_started_ms.take();
     let tokens = p["token_usage"]["output_tokens"].as_u64();
+    let snapshot = s
+        .requests
+        .iter()
+        .find(|r| r.source == "hook" && r.started_ms == start && r.ended_ms.is_none())
+        .cloned();
+    let tier = snapshot
+        .as_ref()
+        .map(|r| (r.service_tier.clone(), r.service_tier_source.clone()))
+        .unwrap_or_else(|| tier_at(s, start.unwrap_or(ts)));
     let mut request = ModelRequest {
         id: format!("hook:{ts}"),
-        model: s.model.clone(),
+        model: snapshot
+            .as_ref()
+            .map(|r| r.model.clone())
+            .unwrap_or_else(|| s.model.clone()),
+        service_tier: tier.0,
+        service_tier_source: tier.1,
+        compaction_id: snapshot
+            .as_ref()
+            .and_then(|r| r.compaction_id.clone())
+            .or_else(|| start.and_then(|time| compaction_at(s, time))),
         started_ms: start,
         ended_ms: Some(ts),
         output_tokens: tokens,
@@ -597,7 +1214,9 @@ fn model_hook(s: &mut Session, p: &Value, ts: i64, name: &str) {
         }
         .into(),
         source: "hook".into(),
+        ..ModelRequest::default()
     };
+    fill_request_cost(&mut request, &p["token_usage"]);
     if let Some(id) = p["response_id"].as_str() {
         request.id = id.into();
     }
@@ -613,6 +1232,7 @@ fn model_hook(s: &mut Session, p: &Value, ts: i64, name: &str) {
         s.requests.len() - 1
     };
     let index = merge_request_usage(s, index);
+    reconcile_request_bill(s, index);
     refresh_latest_tps(s, index);
     s.phase = if completed {
         "模型请求结束"
@@ -980,5 +1600,427 @@ mod tests {
         assert_eq!(s.request_started_ms, Some(4000));
         assert_eq!(s.request_tps, None);
         assert_eq!(s.requests[0].output_tokens, Some(100));
+    }
+
+    fn priced_record(
+        id: &str,
+        turn: &str,
+        time: i64,
+        input: u64,
+        cached: u64,
+        written: u64,
+        output: u64,
+    ) -> Value {
+        json!({"type":"token_usage_record","timestamp_ms":time,"payload":{
+            "response_id":id,"turn_id":turn,"thread_id":"chat","usage":{
+                "input_tokens":input,"cached_input_tokens":cached,
+                "cache_write_input_tokens":written,"output_tokens":output}}})
+    }
+
+    fn billing_turn(s: &mut Session, id: &str, model: &str, time: i64) {
+        apply(
+            s,
+            &json!({"type":"event_msg","timestamp_ms":time,
+            "payload":{"type":"task_started","turn_id":id}}),
+        );
+        apply(
+            s,
+            &json!({"type":"turn_context","timestamp_ms":time+1,
+            "payload":{"turn_id":id,"model":model}}),
+        );
+    }
+
+    // Canonical usage bills cache subsets separately and ignores the same response in hook form.
+    #[test]
+    fn cost_prices_cached_input_once() {
+        let mut s = Session {
+            id: "chat".into(),
+            ..Session::default()
+        };
+        billing_turn(&mut s, "one", "gpt-6.1-sol", 1000);
+        let usage = priced_record("r1", "one", 2000, 1000, 800, 0, 100);
+        apply(&mut s, &usage);
+        apply(&mut s, &usage);
+        apply(
+            &mut s,
+            &json!({"type":"monitor_hook","timestamp_ms":2100,
+            "payload":{"turn_id":"one","hook_event_name":"PostModelRequest","response_id":"r1",
+                "status":"completed","token_usage":{"input_tokens":1000,"cached_input_tokens":800,"output_tokens":100}}}),
+        );
+        assert_eq!(s.cost.priced_requests, 1);
+        assert_eq!(s.cost.unpriced_requests, 0);
+        assert_eq!(s.cost.input_tokens, 1000);
+        assert_eq!(s.cost.cached_input_tokens, 800);
+        assert!((s.cost.total() - 0.00148).abs() < 1e-10);
+        assert!((s.requests[0].cost_usd.unwrap() - 0.00148).abs() < 1e-10);
+    }
+
+    // Costs retain previous turns and mixed models after serialized restart, without replay charges.
+    #[test]
+    fn cost_survives_new_turn_and_restart() {
+        let mut s = Session {
+            id: "chat".into(),
+            ..Session::default()
+        };
+        billing_turn(&mut s, "one", "gpt-6.1-sol", 1000);
+        let first = priced_record("r1", "one", 2000, 1000, 0, 0, 100);
+        apply(&mut s, &first);
+        billing_turn(&mut s, "two", "gpt-6-luna", 3000);
+        apply(&mut s, &priced_record("r2", "two", 4000, 1000, 0, 0, 100));
+        assert!((s.cost.total() - 0.00315).abs() < 1e-10);
+        assert_eq!(s.cost.priced_requests, 2);
+        let json = serde_json::to_string(&s).unwrap();
+        let mut restored: Session = serde_json::from_str(&json).unwrap();
+        apply(&mut restored, &first);
+        assert_eq!(restored.cost.priced_requests, 2);
+        assert_eq!(restored.cost.total(), s.cost.total());
+    }
+
+    // Late old-turn usage uses that turn's model, not the newer visible turn's model.
+    #[test]
+    fn late_usage_uses_saved_billing_model() {
+        let mut s = Session {
+            id: "chat".into(),
+            ..Session::default()
+        };
+        billing_turn(&mut s, "one", "gpt-6.1-sol", 1000);
+        billing_turn(&mut s, "two", "gpt-6-luna", 3000);
+        apply(&mut s, &priced_record("r1", "one", 2000, 1000, 0, 0, 100));
+        assert_eq!(s.turn_id, "two");
+        assert_eq!(s.cost.priced_requests, 1);
+        assert!((s.cost.total() - 0.003).abs() < 1e-10);
+    }
+
+    // Unknown models, incomplete input counters and impossible cache subsets remain unpriced.
+    #[test]
+    fn invalid_and_missing_usage_is_partial_cost() {
+        let mut s = Session {
+            id: "chat".into(),
+            ..Session::default()
+        };
+        billing_turn(&mut s, "one", "unknown-model", 1000);
+        apply(&mut s, &priced_record("r1", "one", 2000, 1000, 0, 0, 100));
+        billing_turn(&mut s, "two", "gpt-6.1-sol", 3000);
+        apply(
+            &mut s,
+            &priced_record("r2", "two", 4000, 1000, 900, 200, 100),
+        );
+        apply(
+            &mut s,
+            &json!({"type":"token_usage_record","timestamp_ms":5000,
+            "payload":{"turn_id":"two","thread_id":"chat","response_id":"r3","usage":{"output_tokens":100}}}),
+        );
+        assert_eq!(s.cost.priced_requests, 0);
+        assert_eq!(s.cost.unpriced_requests, 3);
+        assert_eq!(s.cost.total(), 0.0);
+    }
+
+    // Input cache writes are their own subset; output reasoning is already included in output tokens.
+    #[test]
+    fn cost_separates_write_tokens_and_response_ownership() {
+        let mut s = Session {
+            id: "chat".into(),
+            ..Session::default()
+        };
+        billing_turn(&mut s, "one", "gpt-6.1-sol", 1000);
+        apply(
+            &mut s,
+            &priced_record("r1", "one", 2000, 1000, 400, 100, 100),
+        );
+        let mut copied = priced_record("foreign", "one", 2500, 1000, 0, 0, 100);
+        copied["payload"]["thread_id"] = json!("parent-chat");
+        apply(&mut s, &copied);
+        assert_eq!(s.cost.priced_requests, 1);
+        assert_eq!(s.cost.cache_write_input_tokens, 100);
+        assert!((s.cost.uncached_usd - 0.001).abs() < 1e-10);
+        assert!((s.cost.cached_usd - 0.00004).abs() < 1e-10);
+        assert!((s.cost.write_usd - 0.00025).abs() < 1e-10);
+        assert!((s.cost.output_usd - 0.001).abs() < 1e-10);
+        assert!((s.cost.total() - 0.00229).abs() < 1e-10);
+    }
+
+    // Missing cache telemetry means unknown pricing, not a fabricated all-cache-miss request.
+    #[test]
+    fn missing_cache_counters_are_not_assumed_zero() {
+        let mut s = Session {
+            id: "chat".into(),
+            ..Session::default()
+        };
+        billing_turn(&mut s, "one", "gpt-6.1-sol", 1000);
+        let mut missing_read = priced_record("r1", "one", 2000, 1000, 0, 0, 100);
+        missing_read["payload"]["usage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cached_input_tokens");
+        apply(&mut s, &missing_read);
+        assert_eq!(s.cost.priced_requests, 0);
+        assert_eq!(s.cost.unpriced_requests, 1);
+        assert_eq!(s.requests[0].cached_input_tokens, None);
+        assert_eq!(s.requests[0].cost_usd, None);
+        let mut missing_write = priced_record("r2", "one", 3000, 1000, 0, 0, 100);
+        missing_write["payload"]["usage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_write_input_tokens");
+        apply(&mut s, &missing_write);
+        assert_eq!(s.cost.unpriced_requests, 2);
+        assert_eq!(s.requests[1].cache_write_input_tokens, None);
+        assert_eq!(s.requests[1].cost_usd, None);
+        assert_eq!(s.cost.total(), 0.0);
+    }
+
+    fn service_setting(s: &mut Session, ts: i64, tier: Value) {
+        apply(
+            s,
+            &json!({"type":"event_msg","timestamp_ms":ts,
+            "payload":{"type":"thread_settings_applied","thread_settings":{"service_tier":tier}}}),
+        );
+    }
+
+    fn request_event(s: &mut Session, ts: i64, name: &str) {
+        apply(
+            s,
+            &json!({"type":"monitor_hook","timestamp_ms":ts,
+            "payload":{"turn_id":"one","hook_event_name":name,"status":"completed"}}),
+        );
+    }
+
+    // Each request keeps its Standard/Fast snapshot even when the same turn changes settings again.
+    #[test]
+    fn same_turn_tier_toggles_snapshot_each_request() {
+        let mut s = Session {
+            id: "chat".into(),
+            ..Session::default()
+        };
+        billing_turn(&mut s, "one", "gpt-6.1-sol", 1000);
+        for (index, tier) in [json!("default"), json!("priority"), Value::Null]
+            .into_iter()
+            .enumerate()
+        {
+            let ts = 2000 + index as i64 * 3000;
+            service_setting(&mut s, ts, tier);
+            request_event(&mut s, ts + 100, "PreModelRequest");
+            apply(
+                &mut s,
+                &priced_record(&format!("r{index}"), "one", ts + 500, 1000, 0, 0, 100),
+            );
+            request_event(&mut s, ts + 1000, "PostModelRequest");
+        }
+        assert_eq!(s.requests.len(), 3);
+        assert_eq!(s.requests[0].service_tier, "default");
+        assert_eq!(s.requests[1].service_tier, "priority");
+        assert_eq!(s.requests[2].service_tier, "standard");
+        assert!((s.requests[0].cost_usd.unwrap() - 0.003).abs() < 1e-10);
+        assert!((s.requests[1].cost_usd.unwrap() - 0.006).abs() < 1e-10);
+        assert!((s.cost.total() - 0.012).abs() < 1e-10);
+    }
+
+    // A user change while inference is running affects the next request, not the in-flight one.
+    #[test]
+    fn inflight_request_keeps_its_tier_and_price() {
+        let mut s = Session {
+            id: "chat".into(),
+            ..Session::default()
+        };
+        billing_turn(&mut s, "one", "gpt-6.1-sol", 1000);
+        request_event(&mut s, 1100, "PreModelRequest");
+        service_setting(&mut s, 1200, json!("priority"));
+        apply(&mut s, &priced_record("r1", "one", 1500, 1000, 0, 0, 100));
+        request_event(&mut s, 2000, "PostModelRequest");
+        request_event(&mut s, 2100, "PreModelRequest");
+        service_setting(&mut s, 2200, Value::Null);
+        apply(&mut s, &priced_record("r2", "one", 2500, 1000, 0, 0, 100));
+        request_event(&mut s, 3000, "PostModelRequest");
+        assert_eq!(s.requests[0].service_tier, "standard");
+        assert_eq!(s.requests[1].service_tier, "priority");
+        assert!((s.cost.total() - 0.009).abs() < 1e-10);
+    }
+
+    // Replaying late hook observations corrects an assumed quote once, without duplicating usage.
+    #[test]
+    fn late_priority_snapshot_corrects_assumed_cost() {
+        let mut s = Session {
+            id: "chat".into(),
+            ..Session::default()
+        };
+        billing_turn(&mut s, "one", "gpt-6.1-sol", 1000);
+        apply(&mut s, &priced_record("r1", "one", 1500, 1000, 0, 0, 100));
+        assert!((s.cost.total() - 0.003).abs() < 1e-10);
+        apply(
+            &mut s,
+            &json!({"type":"monitor_hook","timestamp_ms":1100,
+            "payload":{"turn_id":"one","hook_event_name":"PreModelRequest","service_tier":"priority"}}),
+        );
+        request_event(&mut s, 2000, "PostModelRequest");
+        assert_eq!(s.cost.priced_requests, 1);
+        assert_eq!(s.cost.input_tokens, 1000);
+        assert!((s.cost.total() - 0.006).abs() < 1e-10);
+        assert!((s.requests[0].cost_usd.unwrap() - 0.006).abs() < 1e-10);
+    }
+
+    // Missing turn metadata keeps Fast enabled; an explicitly reported null turns it off.
+    #[test]
+    fn absent_service_tier_does_not_reset_reported_priority() {
+        let mut s = Session::default();
+        service_setting(&mut s, 1000, json!("priority"));
+        apply(
+            &mut s,
+            &json!({"type":"turn_context","timestamp_ms":2000,
+            "payload":{"model":"gpt-6.1-sol"}}),
+        );
+        assert_eq!(s.service_tier, "priority");
+        apply(
+            &mut s,
+            &json!({"type":"turn_context","timestamp_ms":3000,
+            "payload":{"model":"gpt-6.1-sol","service_tier":null}}),
+        );
+        assert_eq!(s.service_tier, "standard");
+    }
+
+    // Child membership is fixed when a call starts and survives a later compaction-end observation.
+    #[test]
+    fn compaction_groups_children_and_never_bills_parent_twice() {
+        let mut s = Session {
+            id: "chat".into(),
+            ..Session::default()
+        };
+        billing_turn(&mut s, "one", "gpt-6.1-sol", 1000);
+        request_event(&mut s, 1100, "PreCompact");
+        request_event(&mut s, 1200, "PreModelRequest");
+        apply(
+            &mut s,
+            &json!({"type":"monitor_hook","timestamp_ms":1300,
+            "payload":{"turn_id":"one","hook_event_name":"PreToolUse","tool_use_id":"t1","tool_name":"Bash"}}),
+        );
+        let parent = s.active_compaction.clone();
+        request_event(&mut s, 2000, "PostCompact");
+        apply(&mut s, &priced_record("r1", "one", 2500, 1000, 0, 0, 100));
+        request_event(&mut s, 2600, "PostModelRequest");
+        assert_eq!(s.tools[0].compaction_id, parent);
+        assert_eq!(s.requests[0].compaction_id, parent);
+        assert!(s.active_compaction.is_none());
+        assert_eq!(s.compactions[0].ended_ms, Some(2000));
+        assert_eq!(s.cost.priced_requests, 1);
+        assert!((s.cost.total() - 0.003).abs() < 1e-10);
+        request_event(&mut s, 3000, "PreModelRequest");
+        assert_eq!(s.requests.last().unwrap().compaction_id, None);
+    }
+
+    // End-only logs have no duration; a later complete hook interval reconciles the same completion.
+    #[test]
+    fn compaction_completion_without_start_remains_unknown() {
+        let mut s = Session {
+            turn_id: "one".into(),
+            ..Session::default()
+        };
+        apply(
+            &mut s,
+            &json!({"type":"compacted","timestamp_ms":1800,"payload":{}}),
+        );
+        assert_eq!(s.compactions.len(), 1);
+        assert_eq!(s.compactions[0].started_ms, None);
+        assert!(s.active_compaction.is_none());
+        request_event(&mut s, 1000, "PreCompact");
+        request_event(&mut s, 2000, "PostCompact");
+        assert_eq!(s.compactions.len(), 1);
+        assert_eq!(s.compactions[0].started_ms, Some(1000));
+        assert_eq!(s.compactions[0].ended_ms, Some(2000));
+    }
+
+    // Late earlier settings correct a stale inferred snapshot and its canonical bill exactly once.
+    #[test]
+    fn late_settings_before_request_reprice_snapshot_and_ledger() {
+        let mut s = Session {
+            id: "chat".into(),
+            ..Session::default()
+        };
+        service_setting(&mut s, 100, json!("default"));
+        billing_turn(&mut s, "one", "gpt-6.1-sol", 800);
+        request_event(&mut s, 1000, "PreModelRequest");
+        apply(&mut s, &priced_record("r1", "one", 1100, 1000, 0, 0, 100));
+        request_event(&mut s, 1200, "PostModelRequest");
+        assert_eq!(s.requests[0].service_tier_source, "settings");
+        assert!((s.cost.total() - 0.003).abs() < 1e-10);
+        service_setting(&mut s, 500, json!("priority"));
+        assert_eq!(s.requests[0].service_tier, "priority");
+        assert!((s.requests[0].cost_usd.unwrap() - 0.006).abs() < 1e-10);
+        assert!((s.cost.total() - 0.006).abs() < 1e-10);
+        assert_eq!(s.cost.priced_requests, 1);
+        service_setting(&mut s, 500, json!("priority"));
+        assert!((s.cost.total() - 0.006).abs() < 1e-10);
+    }
+
+    // A later toggle cannot rewrite a request that had already begun, regardless of delivery order.
+    #[test]
+    fn late_settings_after_request_start_do_not_reprice_it() {
+        let mut s = Session {
+            id: "chat".into(),
+            ..Session::default()
+        };
+        service_setting(&mut s, 100, json!("default"));
+        billing_turn(&mut s, "one", "gpt-6.1-sol", 800);
+        request_event(&mut s, 1000, "PreModelRequest");
+        apply(&mut s, &priced_record("r1", "one", 1150, 1000, 0, 0, 100));
+        request_event(&mut s, 1200, "PostModelRequest");
+        service_setting(&mut s, 1100, json!("priority"));
+        assert_eq!(s.requests[0].service_tier, "default");
+        assert!((s.cost.total() - 0.003).abs() < 1e-10);
+    }
+
+    // Explicit request telemetry outranks inferred settings, including settings delivered late.
+    #[test]
+    fn explicit_request_tier_is_not_replaced_by_late_settings() {
+        let mut s = Session {
+            id: "chat".into(),
+            ..Session::default()
+        };
+        billing_turn(&mut s, "one", "gpt-6.1-sol", 800);
+        apply(
+            &mut s,
+            &json!({"type":"monitor_hook","timestamp_ms":1000,
+            "payload":{"turn_id":"one","hook_event_name":"PreModelRequest","service_tier":"standard"}}),
+        );
+        apply(&mut s, &priced_record("r1", "one", 1100, 1000, 0, 0, 100));
+        request_event(&mut s, 1200, "PostModelRequest");
+        service_setting(&mut s, 900, json!("priority"));
+        assert_eq!(s.requests[0].service_tier, "standard");
+        assert_eq!(s.requests[0].service_tier_source, "request");
+        assert!((s.cost.total() - 0.003).abs() < 1e-10);
+    }
+
+    // A bounded timeline eviction does not discard the start needed to correct its persisted bill.
+    #[test]
+    fn ledger_retains_request_start_after_timeline_eviction() {
+        let mut s = Session {
+            id: "chat".into(),
+            ..Session::default()
+        };
+        service_setting(&mut s, 100, json!("default"));
+        billing_turn(&mut s, "one", "gpt-6.1-sol", 800);
+        request_event(&mut s, 1000, "PreModelRequest");
+        apply(&mut s, &priced_record("r1", "one", 1100, 1000, 0, 0, 100));
+        request_event(&mut s, 1200, "PostModelRequest");
+        s.requests.clear();
+        service_setting(&mut s, 500, json!("priority"));
+        assert!((s.cost.total() - 0.006).abs() < 1e-10);
+        assert_eq!(s.cost.priced_requests, 1);
+    }
+
+    // A delayed future toggle cannot temporarily reprice a billed request awaiting its Post hook.
+    #[test]
+    fn billed_inflight_request_retains_its_start_before_post_hook() {
+        let mut s = Session {
+            id: "chat".into(),
+            ..Session::default()
+        };
+        service_setting(&mut s, 100, json!("default"));
+        billing_turn(&mut s, "one", "gpt-6.1-sol", 800);
+        request_event(&mut s, 1000, "PreModelRequest");
+        apply(&mut s, &priced_record("r1", "one", 1500, 1000, 0, 0, 100));
+        service_setting(&mut s, 1200, json!("priority"));
+        assert!((s.cost.total() - 0.003).abs() < 1e-10);
+        request_event(&mut s, 2000, "PostModelRequest");
+        assert!((s.cost.total() - 0.003).abs() < 1e-10);
+        assert_eq!(s.requests[0].service_tier, "default");
     }
 }
