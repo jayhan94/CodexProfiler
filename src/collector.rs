@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 const MAX_SESSIONS: usize = 32;
+const CACHE_VERSION: i64 = 3;
+const DETAILS_CHARS: usize = 32 * 1024;
 const CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -54,6 +56,15 @@ struct ThinPayload {
     id: Option<String>,
     cwd: Option<String>,
     model: Option<String>,
+    source: Option<Value>,
+    agent_role: Option<String>,
+    agent_path: Option<String>,
+    #[serde(deserialize_with = "detail_text")]
+    input: Option<String>,
+    #[serde(deserialize_with = "detail_text")]
+    arguments: Option<String>,
+    #[serde(deserialize_with = "bounded_input")]
+    tool_input: Option<Value>,
     turn_id: Option<String>,
     thread_id: Option<String>,
     response_id: Option<String>,
@@ -147,7 +158,48 @@ fn command_summary<'de, D: serde::Deserializer<'de>>(
             .join(" "),
         _ => return Ok(None),
     };
-    Ok(Some(command.chars().take(160).collect()))
+    Ok(Some(command.chars().take(DETAILS_CHARS).collect()))
+}
+
+// Input is retained for selectable command details, with a fixed per-call memory bound.
+fn detail_text<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    struct Text;
+    impl<'de> serde::de::Visitor<'de> for Text {
+        type Value = Option<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("optional command text")
+        }
+        fn visit_str<E: serde::de::Error>(
+            self,
+            value: &str,
+        ) -> std::result::Result<Self::Value, E> {
+            Ok(Some(value.chars().take(DETAILS_CHARS).collect()))
+        }
+        fn visit_none<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+    deserializer.deserialize_any(Text)
+}
+
+// Hook inputs already exclude tool results; shrink unexpectedly large argument objects as well.
+fn bounded_input<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Value>, D::Error> {
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.map(|v| {
+        let text = v.to_string();
+        if text.len() <= DETAILS_CHARS {
+            v
+        } else {
+            Value::String(text.chars().take(DETAILS_CHARS).collect())
+        }
+    }))
 }
 
 /// Parse only monitored fields. RawValue borrows the original line instead of cloning its payload.
@@ -199,6 +251,7 @@ struct Store {
     db: Connection,
     sessions: HashMap<String, Session>,
     error: Option<String>,
+    titles: HashMap<String, String>,
 }
 
 impl Store {
@@ -216,6 +269,13 @@ impl Store {
              CREATE TABLE IF NOT EXISTS sessions(
                  id TEXT PRIMARY KEY, last_ms INTEGER NOT NULL, state TEXT NOT NULL);",
         )?;
+        if db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))? != CACHE_VERSION
+        {
+            // These tables are a reproducible cache; Codex source logs are never changed.
+            db.execute_batch(
+                "BEGIN; DELETE FROM sources; DELETE FROM sessions; PRAGMA user_version=3; COMMIT;",
+            )?;
+        }
         let sessions = {
             let mut statement =
                 db.prepare("SELECT id,state FROM sessions ORDER BY last_ms DESC LIMIT 32")?;
@@ -232,7 +292,55 @@ impl Store {
             db,
             sessions,
             error: None,
+            titles: HashMap::new(),
         })
+    }
+
+    // Codex's title index is authoritative; appended updates also cover renamed chats.
+    fn load_titles(&mut self, path: &Path) -> Result<()> {
+        let mut file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let length = file.metadata()?.len();
+        let offset = length.saturating_sub(2 * 1024 * 1024);
+        file.seek(SeekFrom::Start(offset))?;
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        if offset > 0 {
+            reader.read_line(&mut line)?;
+        }
+        self.titles.clear();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            if let Ok(row) = serde_json::from_str::<Value>(&line) {
+                if let (Some(id), Some(title)) = (row["id"].as_str(), row["thread_name"].as_str()) {
+                    self.titles
+                        .insert(id.into(), title.chars().take(256).collect());
+                }
+            }
+        }
+        self.apply_titles()?;
+        Ok(())
+    }
+
+    fn apply_titles(&mut self) -> Result<()> {
+        let transaction = self.db.transaction()?;
+        for (id, session) in &mut self.sessions {
+            if let Some(title) = self.titles.get(id) {
+                session.title = title.clone();
+                transaction.execute(
+                    "UPDATE sessions SET state=?2 WHERE id=?1",
+                    params![id, serde_json::to_string(session)?],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -346,16 +454,30 @@ impl Store {
             }
         };
         let payload = &row["payload"];
+        let mixed_hooks = matches!(row["type"].as_str(), Some("monitor_hook" | "hook_event"));
+        // A child/fork transcript can include the parent's copied session metadata.
+        // Only its first metadata record establishes this source file's identity.
         if row["type"] == "session_meta" {
             if let Some(id) = payload["id"].as_str() {
-                *thread_id = id.to_owned();
+                if thread_id.is_empty() {
+                    *thread_id = id.to_owned();
+                } else if id != thread_id {
+                    return Ok(());
+                }
             }
         }
-        let routed = payload["thread_id"]
+        let explicit_id = payload["thread_id"]
             .as_str()
-            .or_else(|| row["thread_id"].as_str())
-            .unwrap_or(thread_id)
-            .to_owned();
+            .or_else(|| row["thread_id"].as_str());
+        let routed = if mixed_hooks {
+            explicit_id.unwrap_or_default().to_owned()
+        } else {
+            // Copied parent events must not update either the parent or child session.
+            if explicit_id.is_some_and(|id| id != thread_id) {
+                return Ok(());
+            }
+            thread_id.clone()
+        };
         if routed.is_empty() {
             self.error = Some(format!("{}: record has no chat identity", path.display()));
             return Ok(());
@@ -363,6 +485,9 @@ impl Store {
         self.ensure_session(&routed)?;
         if let Some(session) = self.sessions.get_mut(&routed) {
             model::apply(session, &row);
+            if let Some(title) = self.titles.get(&routed) {
+                session.title = title.clone();
+            }
         }
         changed.insert(routed);
         Ok(())
@@ -518,6 +643,9 @@ fn watch_sources(
         notify::Config::default(),
     )?;
     watcher.watch(root, RecursiveMode::Recursive)?;
+    if let Some(home) = root.parent() {
+        watcher.watch(home, RecursiveMode::NonRecursive)?;
+    }
     if hooks_dir.exists() {
         watcher.watch(hooks_dir, RecursiveMode::NonRecursive)?;
     }
@@ -535,9 +663,11 @@ fn run(
     let hooks_dir = home.join("monitor");
     let hooks = hooks_dir.join("hooks.jsonl");
     let mut store = Store::open(&db_path)?;
+    let index = home.join("session_index.jsonl");
+    store.load_titles(&index)?;
     let (event_tx, events) = mpsc::sync_channel(64);
     let overflow = Arc::new(AtomicBool::new(false));
-    let _watcher = watch_sources(&root, &hooks_dir, event_tx, overflow.clone())?;
+    let mut watcher = watch_sources(&root, &hooks_dir, event_tx, overflow.clone())?;
     let mut queue = VecDeque::new();
     let mut queued = HashSet::new();
     for path in recent_files(&root)?
@@ -551,7 +681,12 @@ fn run(
     loop {
         if let Some(path) = queue.pop_front() {
             queued.remove(&path);
-            match store.ingest(&path) {
+            let result = if path == index {
+                store.load_titles(&path).map(|_| false)
+            } else {
+                store.ingest(&path)
+            };
+            match result {
                 Ok(true) => enqueue(path, &mut queue, &mut queued),
                 Ok(false) => (),
                 Err(error) => store.error = Some(format!("{}: {error}", path.display())),
@@ -576,7 +711,16 @@ fn run(
             events.try_recv().ok()
         };
         if let Some(event) = event {
+            if let Ok(change) = &event {
+                if change.paths.iter().any(|path| path == &hooks_dir) && hooks_dir.exists() {
+                    if let Err(error) = watcher.watch(&hooks_dir, RecursiveMode::NonRecursive) {
+                        store.error = Some(format!("Hook watcher: {error}"));
+                    }
+                    enqueue(hooks.clone(), &mut queue, &mut queued);
+                }
+            }
             handle_event(event, &hooks, &mut queue, &mut queued, &mut store);
+            dirty |= !queue.is_empty();
         }
         if overflow.swap(false, Ordering::Relaxed) {
             store.error = Some("File event queue overflow: rediscovered recent sources".into());
@@ -601,7 +745,12 @@ fn handle_event(
     match event {
         Ok(event) if !event.kind.is_access() => {
             for path in event.paths {
-                if is_rollout(&path) || path == hooks {
+                if is_rollout(&path)
+                    || path == hooks
+                    || path
+                        .file_name()
+                        .is_some_and(|name| name == "session_index.jsonl")
+                {
                     enqueue(path, queue, queued);
                 }
             }
@@ -717,5 +866,145 @@ mod tests {
         assert!(thin_record(br#"{"type":"world_state","large":"ignored"}"#)
             .unwrap()
             .is_none());
+    }
+
+    /// Official chat names replace old directory fallbacks and survive later prompt observations.
+    #[test]
+    fn official_titles_override_prompt_and_directory() {
+        let dir = fixture("titles");
+        let file = dir.join("rollout-chat.jsonl");
+        let index = dir.join("session_index.jsonl");
+        fs::write(&file, concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"chat\",\"cwd\":\"D:/repo\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"UserMessage\",\"content\":[{\"text\":\"A prompt\"}]}}}\n"
+        )).unwrap();
+        fs::write(
+            &index,
+            "{\"id\":\"chat\",\"thread_name\":\"Real conversation\"}\n",
+        )
+        .unwrap();
+        let mut store = Store::open(&dir.join("state.sqlite")).unwrap();
+        store.load_titles(&index).unwrap();
+        store.ingest(&file).unwrap();
+        assert_eq!(store.sessions["chat"].title, "Real conversation");
+        fs::write(
+            &index,
+            "{\"id\":\"chat\",\"thread_name\":\"Renamed conversation\"}\n",
+        )
+        .unwrap();
+        store.load_titles(&index).unwrap();
+        assert_eq!(store.sessions["chat"].title, "Renamed conversation");
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Details beyond the old 160-character summary are retained, without retaining result text.
+    #[test]
+    fn detailed_commands_and_source_metadata_are_preserved() {
+        let script = format!("prefix-{}-suffix", "x".repeat(2000));
+        let call = serde_json::json!({"type":"response_item","payload":{
+            "type":"custom_tool_call","name":"exec","call_id":"call-a","input":script}});
+        let call = thin_record(&serde_json::to_vec(&call).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(call["payload"]["input"]
+            .as_str()
+            .unwrap()
+            .ends_with("-suffix"));
+        let item = serde_json::json!({"type":"event_msg","payload":{"type":"item_completed",
+            "item":{"type":"CommandExecution","command":["powershell",script],"aggregated_output":"omit"}}});
+        let item = thin_record(&serde_json::to_vec(&item).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(item["payload"]["item"]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("-suffix"));
+        let meta = br#"{"type":"session_meta","payload":{"id":"child","source":{"subagent":{"parent_thread_id":"parent"}}}}"#;
+        assert_eq!(
+            thin_record(meta).unwrap().unwrap()["payload"]["source"]["subagent"]
+                ["parent_thread_id"],
+            "parent"
+        );
+    }
+
+    /// Old reduced caches are invalidated atomically so newly supported records can be replayed.
+    #[test]
+    fn cache_version_replays_original_sources() {
+        let dir = fixture("migration");
+        let db = dir.join("state.sqlite");
+        let file = dir.join("rollout-test.jsonl");
+        fs::write(
+            &file,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"chat\"}}\n",
+        )
+        .unwrap();
+        let mut store = Store::open(&db).unwrap();
+        store.ingest(&file).unwrap();
+        store.db.pragma_update(None, "user_version", 1).unwrap();
+        drop(store);
+        let mut store = Store::open(&db).unwrap();
+        assert!(store.sessions.is_empty());
+        let count: i64 = store
+            .db
+            .query_row("SELECT count(*) FROM sources", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        store.ingest(&file).unwrap();
+        assert!(store.sessions.contains_key("chat"));
+        assert!(file.exists());
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Copied parent metadata/events inside a child file cannot change its bound chat identity.
+    #[test]
+    fn child_transcript_keeps_first_metadata_identity() {
+        let dir = fixture("child-identity");
+        let root_file = dir.join("rollout-root.jsonl");
+        let child_file = dir.join("rollout-child.jsonl");
+        let rows = |values: Vec<Value>| {
+            values
+                .into_iter()
+                .map(|row| row.to_string() + "\n")
+                .collect::<String>()
+        };
+        let record = |time: i64, kind: &str, payload: Value| serde_json::json!({"type":kind,"timestamp_ms":time,"payload":payload});
+        fs::write(&root_file, rows(vec![
+            record(100,"session_meta",serde_json::json!({"id":"root","source":"vscode"})),
+            record(200,"event_msg",serde_json::json!({"type":"task_started","turn_id":"root-turn","thread_id":"root"})),
+            record(300,"token_usage_record",serde_json::json!({"thread_id":"root","turn_id":"root-turn","response_id":"root-response","usage":{"output_tokens":50},"turn_token_usage":{"output_tokens":50}})),
+        ])).unwrap();
+        fs::write(&child_file, rows(vec![
+            record(400,"session_meta",serde_json::json!({"id":"child","source":{"subagent":{"parent_thread_id":"root"}}})),
+            record(401,"session_meta",serde_json::json!({"id":"root","source":"vscode"})),
+            record(402,"event_msg",serde_json::json!({"type":"task_started","turn_id":"copied-parent-turn","thread_id":"root"})),
+            record(403,"token_usage_record",serde_json::json!({"thread_id":"root","turn_id":"copied-parent-turn","response_id":"copied-response","usage":{"output_tokens":999},"turn_token_usage":{"output_tokens":999}})),
+            record(500,"event_msg",serde_json::json!({"type":"task_started","turn_id":"child-turn","thread_id":"child"})),
+            record(600,"token_usage_record",serde_json::json!({"thread_id":"child","turn_id":"child-turn","response_id":"child-response","usage":{"output_tokens":10},"turn_token_usage":{"output_tokens":10}})),
+        ])).unwrap();
+        let mut store = Store::open(&dir.join("state.sqlite")).unwrap();
+        store.ingest(&root_file).unwrap();
+        store.ingest(&child_file).unwrap();
+        assert_eq!(store.sessions["root"].turn_id, "root-turn");
+        assert_eq!(store.sessions["root"].output_tokens, 50);
+        assert_eq!(store.sessions["root"].requests.len(), 1);
+        assert!(!store.sessions["root"].is_internal);
+        assert_eq!(store.sessions["child"].turn_id, "child-turn");
+        assert_eq!(store.sessions["child"].output_tokens, 10);
+        assert_eq!(store.sessions["child"].requests.len(), 1);
+        assert!(store.sessions["child"].is_internal);
+        assert_eq!(store.sessions["child"].parent_id, "root");
+        let bound: String = store
+            .db
+            .query_row(
+                "SELECT thread_id FROM sources WHERE path=?1",
+                [child_file.to_string_lossy().as_ref()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bound, "child");
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -20,6 +20,23 @@ struct HookInput {
     tool_name: Option<String>,
     token_usage: Option<Value>,
     status: Option<String>,
+    response_id: Option<String>,
+    #[serde(default, deserialize_with = "limited_input")]
+    tool_input: Option<Value>,
+}
+
+// Tool arguments are useful diagnostics, while outputs and prompts remain excluded.
+fn limited_input<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
+    let input = Option::<Value>::deserialize(deserializer)?;
+    Ok(input.map(|value| {
+        let text = match value {
+            Value::String(text) => text,
+            other => serde_json::to_string_pretty(&other).unwrap_or_default(),
+        };
+        Value::String(text.chars().take(32 * 1024).collect())
+    }))
 }
 
 /// Resolve the actual chat ID; parent session IDs do not uniquely identify forked chats.

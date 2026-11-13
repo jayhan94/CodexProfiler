@@ -14,6 +14,9 @@ pub struct Snapshot {
 pub struct Session {
     pub id: String,
     pub title: String,
+    pub cwd: String,
+    pub is_internal: bool,
+    pub parent_id: String,
     pub model: String,
     pub phase: String,
     pub turn_id: String,
@@ -23,6 +26,7 @@ pub struct Session {
     pub output_tokens: u64,
     pub request_tps: Option<f64>,
     pub tools: Vec<Tool>,
+    pub requests: Vec<ModelRequest>,
     pub request_started_ms: Option<i64>,
     pub usage_total: u64,
     pub turn_base: u64,
@@ -37,9 +41,22 @@ pub struct Session {
 pub struct Tool {
     pub id: String,
     pub name: String,
+    pub details: String,
     pub started_ms: i64,
     pub ended_ms: Option<i64>,
     pub status: String,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelRequest {
+    pub id: String,
+    pub model: String,
+    pub started_ms: Option<i64>,
+    pub ended_ms: Option<i64>,
+    pub output_tokens: Option<u64>,
+    pub status: String,
+    pub source: String,
 }
 
 pub fn now_ms() -> i64 {
@@ -80,22 +97,23 @@ pub fn apply(s: &mut Session, row: &Value) {
         } else if row["type"] == "event_msg" && p["type"] == "token_count" {
             event(s, p, ts);
         } else if same_turn && row["type"] == "token_usage_record" {
-            usage(s, p);
+            usage(s, p, ts);
         }
+        trim_tools(s);
         return;
     }
     s.last_ms = s.last_ms.max(ts);
     match row["type"].as_str().unwrap_or_default() {
-        "session_meta" => {
-            s.id = text(p, "id");
-            if s.title.is_empty() {
-                s.title = text(p, "cwd");
+        "session_meta" => metadata(s, p),
+        "turn_context" => {
+            s.model = text(p, "model");
+            if s.model == "codex-autoreview" {
+                s.is_internal = true;
             }
         }
-        "turn_context" => s.model = text(p, "model"),
         "event_msg" => event(s, p, ts),
         "response_item" => response(s, p, ts),
-        "token_usage_record" => usage(s, p),
+        "token_usage_record" => usage(s, p, ts),
         "hook_event" | "monitor_hook" => hook(s, p, ts),
         _ => {}
     }
@@ -103,6 +121,9 @@ pub fn apply(s: &mut Session, row: &Value) {
 }
 
 fn trim_tools(s: &mut Session) {
+    if s.requests.len() > 100 {
+        s.requests.drain(..s.requests.len() - 100);
+    }
     if s.tools.len() > 100 {
         s.tools.drain(..s.tools.len() - 100);
     }
@@ -125,6 +146,7 @@ fn begin(s: &mut Session, id: String, ts: i64) {
     s.seen_responses.clear();
     s.record_tokens = 0;
     s.tools.clear();
+    s.requests.clear();
     s.phase = "等待后续事件（模型/网络状态未知）".into();
 }
 
@@ -173,6 +195,7 @@ fn response(s: &mut Session, p: &Value, ts: i64) {
                 Tool {
                     id: text(p, "call_id"),
                     name: text(p, "name"),
+                    details: call_details(p),
                     started_ms: ts,
                     status: "调用已发出".into(),
                     ..Tool::default()
@@ -200,7 +223,11 @@ fn upsert_tool(s: &mut Session, tool: Tool) {
         if t.ended_ms.is_some() && tool.ended_ms.is_none() {
             return;
         }
+        let previous = t.details.clone();
         *t = tool;
+        if t.details.is_empty() {
+            t.details = previous;
+        }
     } else {
         s.tools.push(tool);
     }
@@ -234,11 +261,14 @@ fn command_summary(value: &Value) -> String {
 fn completed_item(s: &mut Session, p: &Value, ts: i64) {
     let i = &p["item"];
     let kind = i["type"].as_str().unwrap_or_default();
-    if kind == "UserMessage" {
-        let content = &i["content"];
-        if let Some(a) = content.as_array() {
-            if let Some(t) = a.iter().find_map(|v| v["text"].as_str()) {
-                s.title = t.chars().take(60).collect();
+    if kind == "UserMessage" && s.title.is_empty() {
+        if let Some(a) = i["content"].as_array() {
+            if let Some(t) = a
+                .iter()
+                .filter_map(|v| v["text"].as_str())
+                .find(|t| genuine_prompt(t))
+            {
+                s.title = t.trim().chars().take(80).collect();
             }
         }
     }
@@ -256,6 +286,11 @@ fn completed_item(s: &mut Session, p: &Value, ts: i64) {
             Tool {
                 id: text(i, "id"),
                 name,
+                details: if kind == "CommandExecution" {
+                    detail(&i["command"])
+                } else {
+                    call_details(i)
+                },
                 started_ms: start,
                 ended_ms: Some(p["completed_at_ms"].as_i64().unwrap_or(ts)),
                 status: if i["exit_code"].as_i64().is_some_and(|n| n != 0) {
@@ -270,10 +305,11 @@ fn completed_item(s: &mut Session, p: &Value, ts: i64) {
 }
 
 // Cumulative per-turn usage is authoritative; response IDs deduplicate older formats.
-fn usage(s: &mut Session, p: &Value) {
+fn usage(s: &mut Session, p: &Value, ts: i64) {
     if p["turn_id"].as_str().is_some_and(|id| id != s.turn_id) {
         return;
     }
+    request_usage(s, p, ts);
     if let Some(total) = p["thread_token_usage"]["output_tokens"].as_u64() {
         s.usage_total = s.usage_total.max(total);
     }
@@ -332,6 +368,7 @@ fn hook(s: &mut Session, p: &Value, ts: i64) {
                 Tool {
                     id: text(p, "tool_use_id"),
                     name: text(p, "tool_name"),
+                    details: detail(&p["tool_input"]),
                     started_ms: ts,
                     status: "工具执行中".into(),
                     ..Tool::default()
@@ -353,6 +390,176 @@ fn hook(s: &mut Session, p: &Value, ts: i64) {
     }
 }
 
+// Metadata describes the workspace; it is never a conversation display title.
+fn metadata(s: &mut Session, p: &Value) {
+    s.id = text(p, "id");
+    s.cwd = text(p, "cwd");
+    let source = &p["source"];
+    let parent = source
+        .pointer("/subagent/parent_thread_id")
+        .or_else(|| source.pointer("/subagent/thread_spawn/parent_thread_id"));
+    if let Some(id) = parent.and_then(Value::as_str) {
+        s.parent_id = id.into();
+    }
+    let origin = source.to_string().to_lowercase();
+    let role = text(p, "agent_role").to_lowercase();
+    s.is_internal |= origin.contains("subagent")
+        || origin.contains("guardian")
+        || role.contains("review")
+        || !s.parent_id.is_empty();
+}
+
+fn genuine_prompt(value: &str) -> bool {
+    let t = value.trim();
+    !t.is_empty()
+        && ![
+            "# AGENTS.md",
+            "<environment_context>",
+            "The following is the Codex",
+            "# Selected text:",
+            "<send_user_message_question",
+            "<INSTRUCTIONS>",
+            "<turn_aborted>",
+        ]
+        .iter()
+        .any(|prefix| t.starts_with(prefix))
+}
+
+// Details remain bounded and preserve the actual script instead of an interpreter-only prefix.
+fn detail(value: &Value) -> String {
+    let text = match value {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        Value::Array(a) if a.iter().all(Value::is_string) => a
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => serde_json::to_string_pretty(value).unwrap_or_default(),
+    };
+    let mut chars = text.chars();
+    let mut result: String = chars.by_ref().take(32 * 1024).collect();
+    if chars.next().is_some() {
+        result.push_str("\n[详情超过 32 KiB，已截断]");
+    }
+    result
+}
+
+fn call_details(p: &Value) -> String {
+    for key in ["input", "arguments", "tool_input", "command"] {
+        let value = detail(&p[key]);
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    String::new()
+}
+
+// Usage-only history is visible but has no invented request start or throughput.
+fn request_usage(s: &mut Session, p: &Value, ts: i64) {
+    let Some(id) = p["response_id"].as_str().filter(|id| !id.is_empty()) else {
+        return;
+    };
+    let tokens = p["usage"]["output_tokens"].as_u64();
+    if let Some(index) = s.requests.iter().position(|r| r.id == id) {
+        s.requests[index].output_tokens = tokens.or(s.requests[index].output_tokens);
+        refresh_latest_tps(s, index);
+        return;
+    }
+    let matches: Vec<_> = s
+        .requests
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            r.source == "hook"
+                && r.started_ms.is_some_and(|start| ts >= start)
+                && r.ended_ms.is_some_and(|end| ts <= end)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if matches.len() == 1 {
+        let r = &mut s.requests[matches[0]];
+        r.id = id.into();
+        r.source = "hook+usage".into();
+        r.output_tokens = tokens.or(r.output_tokens);
+        refresh_latest_tps(s, matches[0]);
+    } else {
+        s.requests.push(ModelRequest {
+            id: id.into(),
+            model: s.model.clone(),
+            ended_ms: Some(ts),
+            output_tokens: tokens,
+            status: "已完成（开始时间未知）".into(),
+            source: "usage".into(),
+            ..ModelRequest::default()
+        });
+    }
+}
+
+// Link only one usage observation strictly within this request's observed boundaries.
+fn merge_request_usage(s: &mut Session, index: usize) -> usize {
+    let Some(start) = s.requests[index].started_ms else {
+        return index;
+    };
+    let Some(end) = s.requests[index].ended_ms else {
+        return index;
+    };
+    let explicit: Vec<_> = s
+        .requests
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.source == "usage" && r.id == s.requests[index].id)
+        .map(|(i, _)| i)
+        .collect();
+    let candidates: Vec<_> = if explicit.is_empty() {
+        s.requests
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                r.source == "usage" && r.ended_ms.is_some_and(|time| time >= start && time <= end)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    } else {
+        explicit
+    };
+    if candidates.len() == 1 {
+        let source = s.requests.remove(candidates[0]);
+        let target = if candidates[0] < index {
+            index - 1
+        } else {
+            index
+        };
+        s.requests[target].id = source.id;
+        s.requests[target].source = "hook+usage".into();
+        s.requests[target].output_tokens =
+            source.output_tokens.or(s.requests[target].output_tokens);
+        return target;
+    }
+    index
+}
+
+// Late usage can fill the last completed request, but cannot replace a newer boundary.
+fn refresh_latest_tps(s: &mut Session, index: usize) {
+    let request = &s.requests[index];
+    if s.request_started_ms.is_some() || request.ended_ms != Some(s.model_boundary_ms) {
+        return;
+    }
+    s.request_tps = if request.status == "已完成" {
+        request
+            .started_ms
+            .zip(request.ended_ms)
+            .filter(|(start, end)| end > start)
+            .and_then(|(start, end)| {
+                request
+                    .output_tokens
+                    .map(|tokens| tokens as f64 * 1000.0 / (end - start) as f64)
+            })
+    } else {
+        None
+    };
+}
+
 // Hook chronology is independent of rollout delivery: a late completion cannot consume a newer start.
 fn model_hook(s: &mut Session, p: &Value, ts: i64, name: &str) {
     if ts <= s.model_boundary_ms {
@@ -361,22 +568,52 @@ fn model_hook(s: &mut Session, p: &Value, ts: i64, name: &str) {
     s.model_boundary_ms = ts;
     if name == "PreModelRequest" {
         s.request_started_ms = Some(ts);
+        s.requests.push(ModelRequest {
+            id: format!("hook:{ts}"),
+            model: s.model.clone(),
+            started_ms: Some(ts),
+            status: "进行中".into(),
+            source: "hook".into(),
+            ..ModelRequest::default()
+        });
         s.phase = "模型请求进行中（含网络和排队）".into();
         return;
     }
     let completed = p["status"]
         .as_str()
         .is_none_or(|status| status == "completed");
-    s.request_tps = s
-        .request_started_ms
-        .take()
-        .filter(|_| completed)
-        .and_then(|start| {
-            p["token_usage"]["output_tokens"]
-                .as_u64()
-                .filter(|_| ts > start)
-                .map(|n| n as f64 * 1000.0 / (ts - start) as f64)
-        });
+    let start = s.request_started_ms.take();
+    let tokens = p["token_usage"]["output_tokens"].as_u64();
+    let mut request = ModelRequest {
+        id: format!("hook:{ts}"),
+        model: s.model.clone(),
+        started_ms: start,
+        ended_ms: Some(ts),
+        output_tokens: tokens,
+        status: if completed {
+            "已完成"
+        } else {
+            p["status"].as_str().unwrap_or("失败")
+        }
+        .into(),
+        source: "hook".into(),
+    };
+    if let Some(id) = p["response_id"].as_str() {
+        request.id = id.into();
+    }
+    let index = s
+        .requests
+        .iter()
+        .position(|r| r.source == "hook" && r.started_ms == start && r.ended_ms.is_none());
+    let index = if let Some(index) = index {
+        s.requests[index] = request;
+        index
+    } else {
+        s.requests.push(request);
+        s.requests.len() - 1
+    };
+    let index = merge_request_usage(s, index);
+    refresh_latest_tps(s, index);
     s.phase = if completed {
         "模型请求结束"
     } else {
@@ -546,5 +783,202 @@ mod tests {
             "payload":{"hook_event_name":"Stop","turn_id":"old"}}),
         );
         assert_eq!(s.ended_ms, None);
+    }
+
+    // Usage inside one hook interval merges into one complete request, preserving exact bounds.
+    #[test]
+    fn usage_and_hook_form_one_request_in_both_delivery_orders() {
+        for delayed in [false, true] {
+            let mut s = Session {
+                turn_id: "a".into(),
+                ..Session::default()
+            };
+            let pre = json!({"type":"monitor_hook","timestamp_ms":1000,
+                "payload":{"turn_id":"a","hook_event_name":"PreModelRequest"}});
+            let post = json!({"type":"monitor_hook","timestamp_ms":3000,
+                "payload":{"turn_id":"a","hook_event_name":"PostModelRequest",
+                    "status":"completed","token_usage":{"output_tokens":100}}});
+            let usage = json!({"type":"token_usage_record","timestamp_ms":2500,
+                "payload":{"turn_id":"a","response_id":"resp-a","usage":{"output_tokens":100}}});
+            apply(&mut s, &pre);
+            if delayed {
+                apply(&mut s, &post);
+                apply(&mut s, &usage);
+            } else {
+                apply(&mut s, &usage);
+                apply(&mut s, &post);
+            }
+            assert_eq!(s.requests.len(), 1);
+            assert_eq!(s.requests[0].id, "resp-a");
+            assert_eq!(s.requests[0].started_ms, Some(1000));
+            assert_eq!(s.requests[0].ended_ms, Some(3000));
+            assert_eq!(s.request_tps, Some(50.0));
+        }
+    }
+
+    // Two usage responses within the interval are ambiguous and must never be guessed into one.
+    #[test]
+    fn ambiguous_usage_keeps_separate_observations() {
+        let mut s = Session {
+            turn_id: "a".into(),
+            ..Session::default()
+        };
+        apply(
+            &mut s,
+            &json!({"type":"monitor_hook","timestamp_ms":1000,
+            "payload":{"turn_id":"a","hook_event_name":"PreModelRequest"}}),
+        );
+        for (id, ts) in [("one", 1500), ("two", 2000)] {
+            apply(
+                &mut s,
+                &json!({"type":"token_usage_record","timestamp_ms":ts,
+                "payload":{"turn_id":"a","response_id":id,"usage":{"output_tokens":40}}}),
+            );
+        }
+        apply(
+            &mut s,
+            &json!({"type":"monitor_hook","timestamp_ms":3000,
+            "payload":{"turn_id":"a","hook_event_name":"PostModelRequest",
+                "status":"completed","token_usage":{"output_tokens":80}}}),
+        );
+        assert_eq!(s.requests.len(), 3);
+        assert_eq!(s.requests.iter().filter(|r| r.source == "usage").count(), 2);
+    }
+
+    // Completed history without request boundaries has a visible row and no invented TPS.
+    #[test]
+    fn usage_history_has_unknown_start_and_failed_hook_has_no_rate() {
+        let mut s = Session {
+            turn_id: "a".into(),
+            ..Session::default()
+        };
+        apply(
+            &mut s,
+            &json!({"type":"token_usage_record","timestamp_ms":1000,
+            "payload":{"turn_id":"a","response_id":"historic","usage":{"output_tokens":42}}}),
+        );
+        assert_eq!(s.requests[0].started_ms, None);
+        assert_eq!(s.requests[0].output_tokens, Some(42));
+        assert_eq!(s.request_tps, None);
+        for (event, ts) in [("PreModelRequest", 2000), ("PostModelRequest", 3000)] {
+            apply(
+                &mut s,
+                &json!({"type":"monitor_hook","timestamp_ms":ts,
+                "payload":{"turn_id":"a","hook_event_name":event,"status":"failed"}}),
+            );
+        }
+        assert_eq!(s.requests.last().unwrap().status, "failed");
+        assert_eq!(s.request_tps, None);
+    }
+
+    // Code-mode scripts and argv contents must remain inspectable beyond the summary's 160 chars.
+    #[test]
+    fn command_details_preserve_script_body() {
+        let mut s = Session::default();
+        let script = format!("{}\nprint('actual command')", "#".repeat(1000));
+        apply(
+            &mut s,
+            &json!({"type":"response_item","timestamp_ms":1000,
+            "payload":{"type":"custom_tool_call","name":"exec","call_id":"tool-a","input":script}}),
+        );
+        assert!(s.tools[0].details.ends_with("print('actual command')"));
+        assert!(s.tools[0].details.len() > 1000);
+        apply(
+            &mut s,
+            &json!({"type":"event_msg","timestamp_ms":3000,
+            "payload":{"type":"item_completed","started_at_ms":1000,"completed_at_ms":2000,
+                "item":{"type":"CommandExecution","id":"nested","command":["runtime.exe","exec",script]}}}),
+        );
+        assert!(s.tools.last().unwrap().details.contains("actual command"));
+    }
+
+    // Workspace paths and injected instructions are not user-facing conversation names.
+    #[test]
+    fn metadata_and_fallback_title_are_separate() {
+        let mut s = Session::default();
+        apply(
+            &mut s,
+            &json!({"type":"session_meta","timestamp_ms":1000,
+            "payload":{"id":"chat","cwd":"D:/project","source":"vscode"}}),
+        );
+        assert!(s.title.is_empty());
+        assert_eq!(s.cwd, "D:/project");
+        for (text, ts) in [
+            ("# AGENTS.md instructions", 2000),
+            ("请修复登录问题", 3000),
+            ("继续下一步", 4000),
+        ] {
+            apply(
+                &mut s,
+                &json!({"type":"event_msg","timestamp_ms":ts,
+                "payload":{"type":"item_completed","item":{"type":"UserMessage","content":[{"text":text}]}}}),
+            );
+        }
+        assert_eq!(s.title, "请修复登录问题");
+        apply(
+            &mut s,
+            &json!({"type":"session_meta","timestamp_ms":5000,
+            "payload":{"id":"child","source":{"subagent":{"thread_spawn":{"parent_thread_id":"root"}}}}}),
+        );
+        assert!(s.is_internal);
+        assert_eq!(s.parent_id, "root");
+    }
+
+    // A nullable hook usage field is filled by its unique usage record in either delivery order.
+    #[test]
+    fn nullable_hook_usage_updates_summary_in_both_orders() {
+        for delayed in [false, true] {
+            let mut s = Session {
+                turn_id: "a".into(),
+                ..Session::default()
+            };
+            let pre = json!({"type":"monitor_hook","timestamp_ms":1000,
+                "payload":{"turn_id":"a","hook_event_name":"PreModelRequest"}});
+            let post = json!({"type":"monitor_hook","timestamp_ms":3000,
+                "payload":{"turn_id":"a","hook_event_name":"PostModelRequest",
+                    "status":"completed","token_usage":null}});
+            let usage = json!({"type":"token_usage_record","timestamp_ms":2500,
+                "payload":{"turn_id":"a","response_id":"resp-a","usage":{"output_tokens":100}}});
+            apply(&mut s, &pre);
+            if delayed {
+                apply(&mut s, &post);
+                apply(&mut s, &usage);
+            } else {
+                apply(&mut s, &usage);
+                apply(&mut s, &post);
+            }
+            assert_eq!(s.requests.len(), 1);
+            assert_eq!(s.requests[0].output_tokens, Some(100));
+            assert_eq!(s.request_tps, Some(50.0));
+        }
+    }
+
+    // Usage for an older request must not replace the summary after a newer request has begun.
+    #[test]
+    fn late_usage_cannot_replace_newer_inflight_summary() {
+        let mut s = Session {
+            turn_id: "a".into(),
+            ..Session::default()
+        };
+        for (name, ts) in [
+            ("PreModelRequest", 1000),
+            ("PostModelRequest", 3000),
+            ("PreModelRequest", 4000),
+        ] {
+            apply(
+                &mut s,
+                &json!({"type":"monitor_hook","timestamp_ms":ts,
+                "payload":{"turn_id":"a","hook_event_name":name,
+                    "status":"completed","token_usage":null}}),
+            );
+        }
+        apply(
+            &mut s,
+            &json!({"type":"token_usage_record","timestamp_ms":2500,
+            "payload":{"turn_id":"a","response_id":"old","usage":{"output_tokens":100}}}),
+        );
+        assert_eq!(s.request_started_ms, Some(4000));
+        assert_eq!(s.request_tps, None);
+        assert_eq!(s.requests[0].output_tokens, Some(100));
     }
 }

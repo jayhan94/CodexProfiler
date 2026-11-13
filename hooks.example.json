@@ -1,1 +1,114 @@
-{"hooks":{"Interrupt":[{"hooks":[{"command":"\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"","timeout":1,"type":"command"}]}],"PermissionRequest":[{"hooks":[{"command":"\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"","timeout":1,"type":"command"}]}],"PostCompact":[{"hooks":[{"command":"\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"","timeout":1,"type":"command"}]}],"PostModelRequest":[{"hooks":[{"command":"\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"","timeout":1,"type":"command"}]}],"PostToolUse":[{"hooks":[{"command":"\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"","timeout":1,"type":"command"}]}],"PreCompact":[{"hooks":[{"command":"\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"","timeout":1,"type":"command"}]}],"PreModelRequest":[{"hooks":[{"command":"\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"","timeout":1,"type":"command"}]}],"PreToolUse":[{"hooks":[{"command":"\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"","timeout":1,"type":"command"}]}],"Stop":[{"hooks":[{"command":"\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"","timeout":1,"type":"command"}]}],"UserPromptSubmit":[{"hooks":[{"command":"\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"","timeout":1,"type":"command"}]}]}}
+{
+  "hooks": {
+    "Interrupt": [
+      {
+        "hooks": [
+          {
+            "command": "\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "timeout": 1,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "command": "\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "timeout": 1,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "command": "\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "timeout": 1,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PostModelRequest": [
+      {
+        "hooks": [
+          {
+            "command": "\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "timeout": 1,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "timeout": 1,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "command": "\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "timeout": 1,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PreModelRequest": [
+      {
+        "hooks": [
+          {
+            "command": "\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "timeout": 1,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "timeout": 1,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "timeout": 1,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "command": "\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "timeout": 1,
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}

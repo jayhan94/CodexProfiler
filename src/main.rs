@@ -74,6 +74,10 @@ fn headless(options: Options, seconds: u64) {
                 serde_json::json!({
                     "id": session.id,
                     "phase": session.phase,
+                    "title": session.title,
+                    "is_internal": session.is_internal,
+                    "requests": session.requests.len(),
+                    "commands_with_details": session.tools.iter().filter(|t| !t.details.is_empty()).count(),
                     "turn_id": session.turn_id,
                     "output_tokens": session.output_tokens,
                     "tools": session.tools.len(),
