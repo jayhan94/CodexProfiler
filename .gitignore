@@ -1,0 +1,5 @@
+/target/
+/data/
+/.tools/
+*.sqlite*
+/dist/
