@@ -86,6 +86,13 @@ pub fn configuration(executable: &Path, home: &Path) -> Value {
         executable.display(),
         home.display()
     );
+    // Codex may launch through either cmd or PowerShell on Windows.
+    // Explicit cmd/call handles quoted executable paths in both shells.
+    let windows_command = format!(
+        "cmd.exe /d /c call \"{}\" --hook --codex-home \"{}\"",
+        executable.display(),
+        home.display()
+    );
     let mut hooks = serde_json::Map::new();
     for event in [
         "UserPromptSubmit",
@@ -101,7 +108,7 @@ pub fn configuration(executable: &Path, home: &Path) -> Value {
     ] {
         hooks.insert(
             event.into(),
-            json!([{"hooks": [{"type":"command", "command":command, "timeout":1}]}]),
+            json!([{"hooks": [{"type":"command", "command":command, "commandWindows":windows_command, "timeout":3}]}]),
         );
     }
     json!({"hooks": hooks})
@@ -121,12 +128,24 @@ mod tests {
             "PreToolUse",
             "PostToolUse",
         ] {
-            assert_eq!(config["hooks"][event][0]["hooks"][0]["timeout"], 1);
+            assert_eq!(config["hooks"][event][0]["hooks"][0]["timeout"], 3);
             assert!(config["hooks"][event][0]["hooks"][0]["command"]
                 .as_str()
                 .unwrap()
                 .contains("--codex-home \"source\""));
         }
+    }
+
+    // Windows overrides explicitly invoke cmd rather than relying on PowerShell expression syntax.
+    #[test]
+    fn windows_command_supports_quoted_paths() {
+        let config = configuration(
+            Path::new("D:/Project With Spaces/monitor.exe"),
+            Path::new("C:/User Data/.codex"),
+        );
+        let handler = &config["hooks"]["PreModelRequest"][0]["hooks"][0];
+        assert_eq!(handler["commandWindows"], "cmd.exe /d /c call \"D:/Project With Spaces/monitor.exe\" --hook --codex-home \"C:/User Data/.codex\"");
+        assert_eq!(handler["timeout"], 3);
     }
 
     /// Parent session IDs cannot silently stand in for the actual transcript identity.

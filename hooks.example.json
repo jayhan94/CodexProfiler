@@ -5,7 +5,8 @@
         "hooks": [
           {
             "command": "\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
-            "timeout": 1,
+            "commandWindows": "cmd.exe /d /c call \"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -16,7 +17,8 @@
         "hooks": [
           {
             "command": "\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
-            "timeout": 1,
+            "commandWindows": "cmd.exe /d /c call \"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -27,7 +29,8 @@
         "hooks": [
           {
             "command": "\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
-            "timeout": 1,
+            "commandWindows": "cmd.exe /d /c call \"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -38,7 +41,8 @@
         "hooks": [
           {
             "command": "\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
-            "timeout": 1,
+            "commandWindows": "cmd.exe /d /c call \"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -49,7 +53,8 @@
         "hooks": [
           {
             "command": "\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
-            "timeout": 1,
+            "commandWindows": "cmd.exe /d /c call \"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -60,7 +65,8 @@
         "hooks": [
           {
             "command": "\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
-            "timeout": 1,
+            "commandWindows": "cmd.exe /d /c call \"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -71,7 +77,8 @@
         "hooks": [
           {
             "command": "\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
-            "timeout": 1,
+            "commandWindows": "cmd.exe /d /c call \"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -82,7 +89,8 @@
         "hooks": [
           {
             "command": "\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
-            "timeout": 1,
+            "commandWindows": "cmd.exe /d /c call \"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -93,7 +101,8 @@
         "hooks": [
           {
             "command": "\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
-            "timeout": 1,
+            "commandWindows": "cmd.exe /d /c call \"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -104,7 +113,8 @@
         "hooks": [
           {
             "command": "\"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
-            "timeout": 1,
+            "commandWindows": "cmd.exe /d /c call \"D:\\OpenSource\\codex-monitor\\dist\\codex-monitor.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "timeout": 3,
             "type": "command"
           }
         ]
