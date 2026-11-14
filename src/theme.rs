@@ -11,9 +11,15 @@ pub const PINK_SOFT: Color32 = Color32::from_rgb(242, 210, 221);
 pub const YELLOW: Color32 = Color32::from_rgb(242, 207, 70);
 pub const YELLOW_SOFT: Color32 = Color32::from_rgb(250, 232, 156);
 pub const BORDER: Color32 = Color32::from_rgb(70, 64, 64);
+// MotherDuck homepage CTA, pressed state, and dark blue for readable link text.
+pub const BLUE: Color32 = Color32::from_rgb(151, 212, 255);
+pub const BLUE_ACTIVE: Color32 = Color32::from_rgb(111, 194, 255);
+pub const BLUE_INK: Color32 = Color32::from_rgb(38, 111, 168);
 
 /// Shared colors, spacing and typography keep the interface quiet without animated redraws.
 pub fn install(context: &egui::Context) {
+    // Keep the warm light palette when the native window reports the system theme.
+    context.set_theme(egui::Theme::Light);
     fonts(context);
     let mut style = (*context.style()).clone();
     style.visuals = egui::Visuals::light();
@@ -27,9 +33,9 @@ pub fn install(context: &egui::Context) {
     visuals.faint_bg_color = BG;
     visuals.extreme_bg_color = SURFACE;
     visuals.code_bg_color = BG;
-    visuals.selection.bg_fill = PINK_SOFT;
-    visuals.selection.stroke = Stroke::new(1.0_f32, PINK);
-    visuals.hyperlink_color = PINK;
+    visuals.selection.bg_fill = BLUE;
+    visuals.selection.stroke = Stroke::new(1.0_f32, INK);
+    visuals.hyperlink_color = BLUE_INK;
     visuals.warn_fg_color = Color32::from_rgb(137, 102, 35);
     visuals.error_fg_color = Color32::from_rgb(165, 57, 77);
     for widget in [
@@ -44,11 +50,12 @@ pub fn install(context: &egui::Context) {
     }
     visuals.widgets.inactive.bg_fill = SURFACE;
     visuals.widgets.inactive.weak_bg_fill = SURFACE;
-    visuals.widgets.hovered.bg_fill = PINK_SOFT;
-    visuals.widgets.hovered.weak_bg_fill = PINK_SOFT;
-    visuals.widgets.active.bg_fill = PINK_SOFT;
-    visuals.widgets.active.weak_bg_fill = PINK_SOFT;
-    visuals.widgets.open.bg_fill = PINK_SOFT;
+    visuals.widgets.hovered.bg_fill = BLUE;
+    visuals.widgets.hovered.weak_bg_fill = BLUE;
+    visuals.widgets.active.bg_fill = BLUE_ACTIVE;
+    visuals.widgets.active.weak_bg_fill = BLUE_ACTIVE;
+    visuals.widgets.open.bg_fill = BLUE;
+    visuals.widgets.open.weak_bg_fill = BLUE;
     style.spacing.item_spacing = egui::vec2(10.0, 9.0);
     style.spacing.button_padding = egui::vec2(12.0, 7.0);
     style.spacing.interact_size.y = 28.0;
