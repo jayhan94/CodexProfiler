@@ -1,4 +1,5 @@
-use crate::model::{self, Session, Snapshot};
+use crate::coverage_migration;
+use crate::model::{self, CostMember, CostSummary, Session, Snapshot};
 use eframe::egui;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -11,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use walkdir::WalkDir;
 
 const MAX_SESSIONS: usize = 96;
@@ -27,6 +28,7 @@ pub fn start(home: PathBuf, db_path: PathBuf, ctx: egui::Context) -> mpsc::Recei
         if let Err(error) = run(home, db_path, &ctx, &tx) {
             let _ = tx.try_send(Snapshot {
                 sessions: Vec::new(),
+                costs: Vec::new(),
                 error: Some(error.to_string()),
                 updated_ms: model::now_ms(),
             });
@@ -79,6 +81,7 @@ struct ThinPayload {
     tool_input: Option<Value>,
     turn_id: Option<String>,
     thread_id: Option<String>,
+    agent_id: Option<String>,
     response_id: Option<String>,
     call_id: Option<String>,
     name: Option<String>,
@@ -296,6 +299,116 @@ struct Store {
     sessions: HashMap<String, Session>,
     error: Option<String>,
     titles: HashMap<String, String>,
+    costs: HashMap<String, CostMember>,
+    catalog: HashMap<PathBuf, CatalogEntry>,
+    source_offsets: HashMap<PathBuf, (u64, String)>,
+    member_sources: HashMap<String, HashSet<PathBuf>>,
+    failed_sources: HashSet<PathBuf>,
+    attempted_sources: HashSet<PathBuf>,
+}
+
+/// Historical ownership and costs stay resident without retaining historical tool bodies.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct CachedCost {
+    id: String,
+    parent_id: String,
+    thread_kind: String,
+    title: String,
+    agent_name: String,
+    cost: Option<CostSummary>,
+    cost_coverage_incomplete: Option<bool>,
+}
+
+impl CachedCost {
+    fn member(self) -> CostMember {
+        CostMember {
+            id: self.id,
+            parent_id: self.parent_id,
+            thread_kind: self.thread_kind,
+            title: self.title,
+            agent_name: self.agent_name,
+            partial: self.cost.is_none() || self.cost_coverage_incomplete != Some(false),
+            cost: self.cost,
+        }
+    }
+}
+
+struct CatalogEntry {
+    member: CostMember,
+    length: u64,
+    modified: SystemTime,
+}
+
+/// Another rollout may have sparse or conflicting metadata; known ownership remains authoritative.
+fn supplement_cost_metadata(member: &mut CostMember, observed: &CostMember) {
+    let repair_kind = member.parent_id.is_empty()
+        && matches!(member.thread_kind.as_str(), "" | "conversation")
+        && !observed.parent_id.is_empty()
+        && matches!(observed.thread_kind.as_str(), "subagent" | "side_chat");
+    if member.parent_id.is_empty()
+        && (member.thread_kind.is_empty()
+            || member.thread_kind == observed.thread_kind
+            || repair_kind)
+    {
+        member.parent_id = observed.parent_id.clone();
+    }
+    if member.thread_kind.is_empty() || repair_kind {
+        member.thread_kind = observed.thread_kind.clone();
+    }
+    if member.agent_name.is_empty() {
+        member.agent_name = observed.agent_name.clone();
+    }
+}
+
+/// Only the first metadata record establishes source ownership, including copied child histories.
+fn catalog_entry(path: &Path) -> Result<Option<CatalogEntry>> {
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    let mut first = String::new();
+    BufReader::new(file.take(1024 * 1024)).read_line(&mut first)?;
+    let Ok(row) = serde_json::from_str::<Value>(&first) else {
+        return Ok(None);
+    };
+    if row["type"] != "session_meta" || row["payload"]["id"].as_str().is_none() {
+        return Ok(None);
+    }
+    let mut session = Session::default();
+    model::apply(&mut session, &row);
+    let mut member = CostMember::from_session(&session);
+    member.cost = None;
+    member.partial = true;
+    Ok(Some(CatalogEntry {
+        member,
+        length: metadata.len(),
+        modified: metadata.modified()?,
+    }))
+}
+
+fn load_cost_index(db: &Connection) -> Result<HashMap<String, CostMember>> {
+    let mut statement = db.prepare("SELECT id,state FROM sessions")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut costs = HashMap::new();
+    for row in rows {
+        let (id, state) = row?;
+        let mut member = serde_json::from_str::<CachedCost>(&state)?.member();
+        member.id = id.clone();
+        costs.insert(id, member);
+    }
+    Ok(costs)
+}
+
+fn load_source_offsets(db: &Connection) -> Result<HashMap<PathBuf, (u64, String)>> {
+    let mut statement = db.prepare("SELECT path,offset,thread_id FROM sources")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            PathBuf::from(row.get::<_, String>(0)?),
+            (row.get::<_, u64>(1)?, row.get::<_, String>(2)?),
+        ))
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
 impl Store {
@@ -313,6 +426,7 @@ impl Store {
              CREATE TABLE IF NOT EXISTS sessions(
                  id TEXT PRIMARY KEY, last_ms INTEGER NOT NULL, state TEXT NOT NULL);",
         )?;
+        coverage_migration::ensure_schema(&db)?;
         if db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))? != CACHE_VERSION
         {
             // These tables are a reproducible cache; Codex source logs are never changed.
@@ -332,11 +446,28 @@ impl Store {
             }
             sessions
         };
+        let costs = load_cost_index(&db)?;
+        let source_offsets = load_source_offsets(&db)?;
+        let mut member_sources: HashMap<String, HashSet<PathBuf>> = HashMap::new();
+        for (path, (_, id)) in &source_offsets {
+            if !id.is_empty() && is_rollout(path) {
+                member_sources
+                    .entry(id.clone())
+                    .or_default()
+                    .insert(path.clone());
+            }
+        }
         Ok(Self {
             db,
             sessions,
             error: None,
             titles: HashMap::new(),
+            costs,
+            catalog: HashMap::new(),
+            source_offsets,
+            member_sources,
+            failed_sources: HashSet::new(),
+            attempted_sources: HashSet::new(),
         })
     }
 
@@ -373,6 +504,11 @@ impl Store {
     }
 
     fn apply_titles(&mut self) -> Result<()> {
+        for (id, member) in &mut self.costs {
+            if let Some(title) = self.titles.get(id) {
+                member.title = title.clone();
+            }
+        }
         let transaction = self.db.transaction()?;
         for (id, session) in &mut self.sessions {
             if let Some(title) = self.titles.get(id) {
@@ -393,9 +529,170 @@ impl Store {
         sessions.truncate(MAX_SESSIONS);
         Snapshot {
             sessions,
+            costs: self.cost_snapshot(),
             error: self.error.clone(),
             updated_ms: model::now_ms(),
         }
+    }
+
+    fn cost_snapshot(&self) -> Vec<CostMember> {
+        let mut costs: Vec<_> = self
+            .costs
+            .values()
+            .cloned()
+            .map(|mut member| {
+                member.partial |= !self.sources_complete(&member.id);
+                member
+            })
+            .collect();
+        costs.sort_by(|left, right| left.id.cmp(&right.id));
+        costs
+    }
+
+    /// A cached row is not proof that every source reached EOF, including copied rollout files.
+    fn sources_complete(&self, id: &str) -> bool {
+        self.member_sources.get(id).is_some_and(|paths| {
+            !paths.is_empty()
+                && paths.iter().all(|path| {
+                    !self.failed_sources.contains(path)
+                        && self.catalog.get(path).is_some_and(|entry| {
+                            self.source_offsets
+                                .get(path)
+                                .is_some_and(|(offset, owner)| {
+                                    owner == id && *offset == entry.length
+                                })
+                        })
+                })
+        })
+    }
+
+    /// Repair old metadata without replaying or replacing committed billing state and cursors.
+    fn register_source(&mut self, path: &Path, mut entry: CatalogEntry) -> Result<()> {
+        let id = entry.member.id.clone();
+        let previous = self.costs.get(&id);
+        let mut member = previous.cloned().unwrap_or_else(|| entry.member.clone());
+        supplement_cost_metadata(&mut member, &entry.member);
+        let changed = previous.is_some_and(|old| {
+            old.parent_id != member.parent_id
+                || old.thread_kind != member.thread_kind
+                || old.agent_name != member.agent_name
+        });
+        if changed {
+            self.db.execute(
+                "UPDATE sessions SET state=json_set(state,
+                '$.parent_id',?2,'$.thread_kind',?3,'$.agent_name',?4) WHERE id=?1",
+                params![id, member.parent_id, member.thread_kind, member.agent_name],
+            )?;
+        }
+        if let Some(title) = self.titles.get(&id) {
+            member.title = title.clone();
+        }
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.parent_id = member.parent_id.clone();
+            session.thread_kind = member.thread_kind.clone();
+            session.agent_name = member.agent_name.clone();
+            session.is_internal |= matches!(member.thread_kind.as_str(), "internal" | "subagent");
+        }
+        entry.member.parent_id = member.parent_id.clone();
+        entry.member.thread_kind = member.thread_kind.clone();
+        entry.member.agent_name = member.agent_name.clone();
+        self.costs.insert(id.clone(), member);
+        self.member_sources
+            .entry(id)
+            .or_default()
+            .insert(path.to_owned());
+        self.catalog.insert(path.to_owned(), entry);
+        Ok(())
+    }
+
+    fn observe_source(&mut self, path: &Path) -> Result<()> {
+        if !is_rollout(path) {
+            return Ok(());
+        }
+        if let Some(entry) = self.catalog.get_mut(path) {
+            let metadata = path.metadata()?;
+            entry.length = metadata.len();
+            entry.modified = metadata.modified()?;
+        } else if let Some(entry) = catalog_entry(path)? {
+            self.register_source(path, entry)?;
+        }
+        Ok(())
+    }
+
+    /// Full discovery occurs only at startup/overflow; ordinary updates inspect their own source.
+    fn discover(&mut self, root: &Path) -> Result<Vec<PathBuf>> {
+        self.catalog.clear();
+        self.attempted_sources.clear();
+        self.failed_sources.clear();
+        if root.exists() {
+            for entry in WalkDir::new(root) {
+                let entry = entry?;
+                if is_rollout(entry.path()) && entry.file_type().is_file() {
+                    match catalog_entry(entry.path()) {
+                        Ok(Some(source)) => self.register_source(entry.path(), source)?,
+                        Ok(None) => (),
+                        Err(error) => {
+                            self.error = Some(format!("{}: {error}", entry.path().display()))
+                        }
+                    }
+                }
+            }
+        }
+        let mut recent = recent_catalog_paths(&self.catalog);
+        let roots: Vec<_> = recent
+            .iter()
+            .filter_map(|path| self.catalog.get(path))
+            .map(|entry| entry.member.id.clone())
+            .collect();
+        recent.extend(self.family_paths(roots));
+        Ok(recent)
+    }
+
+    fn pending_family_paths(&self) -> Vec<PathBuf> {
+        self.family_paths(self.sessions.keys().cloned())
+    }
+
+    /// Metadata owns the edges: references and ordinary forks cannot transfer another chat's costs.
+    fn family_paths(&self, roots: impl IntoIterator<Item = String>) -> Vec<PathBuf> {
+        let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+        for member in self.costs.values() {
+            if matches!(member.thread_kind.as_str(), "subagent" | "side_chat") {
+                children
+                    .entry(&member.parent_id)
+                    .or_default()
+                    .push(&member.id);
+            }
+        }
+        let mut queue: VecDeque<_> = roots.into_iter().collect();
+        let mut seen = HashSet::new();
+        let mut paths = HashSet::new();
+        while let Some(id) = queue.pop_front() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if let Some(descendants) = children.get(id.as_str()) {
+                queue.extend(descendants.iter().map(|id| (*id).to_owned()));
+            }
+            if let Some(sources) = self.member_sources.get(&id) {
+                for path in sources {
+                    let unfinished = self.catalog.get(path).is_some_and(|entry| {
+                        !self
+                            .source_offsets
+                            .get(path)
+                            .is_some_and(|(offset, owner)| owner == &id && *offset == entry.length)
+                    });
+                    if unfinished
+                        && !self.failed_sources.contains(path)
+                        && !self.attempted_sources.contains(path)
+                    {
+                        paths.insert(path.clone());
+                    }
+                }
+            }
+        }
+        let mut paths: Vec<_> = paths.into_iter().collect();
+        paths.sort();
+        paths
     }
 
     fn ensure_session(&mut self, id: &str) -> Result<()> {
@@ -404,13 +701,27 @@ impl Store {
                 .db
                 .query_row("SELECT state FROM sessions WHERE id=?1", [id], |r| r.get(0))
                 .optional()?;
-            let session = match state {
+            let is_new = state.is_none();
+            let mut session = match state {
                 Some(state) => serde_json::from_str(&state)?,
                 None => Session {
                     id: id.to_owned(),
                     ..Session::default()
                 },
             };
+            if is_new {
+                model::reset_cost_coverage(&mut session);
+            }
+            if is_new || session.cost_coverage_incomplete.is_none() {
+                coverage_migration::restore(&self.db, &mut session, is_new)?;
+            }
+            if let Some(member) = self.costs.get(id) {
+                session.parent_id = member.parent_id.clone();
+                session.thread_kind = member.thread_kind.clone();
+                session.agent_name = member.agent_name.clone();
+                session.is_internal |=
+                    matches!(session.thread_kind.as_str(), "internal" | "subagent");
+            }
             self.sessions.insert(id.to_owned(), session);
         }
         Ok(())
@@ -418,6 +729,8 @@ impl Store {
 
     /// Replaying or resuming a file never counts previously committed tokens twice.
     fn ingest(&mut self, path: &Path) -> Result<bool> {
+        self.observe_source(path)?;
+        self.attempted_sources.insert(path.to_owned());
         let key = path.to_string_lossy().into_owned();
         let saved: Option<(u64, String)> = self
             .db
@@ -529,6 +842,15 @@ impl Store {
         self.ensure_session(&routed)?;
         if let Some(session) = self.sessions.get_mut(&routed) {
             model::apply(session, &row);
+            if row["type"] == "session_meta" {
+                if let Some(member) = self.costs.get(&routed) {
+                    session.parent_id = member.parent_id.clone();
+                    session.thread_kind = member.thread_kind.clone();
+                    session.agent_name = member.agent_name.clone();
+                    session.is_internal |=
+                        matches!(member.thread_kind.as_str(), "internal" | "subagent");
+                }
+            }
             if let Some(title) = self.titles.get(&routed) {
                 session.title = title.clone();
             }
@@ -601,6 +923,13 @@ impl Store {
             params![path, offset, thread_id],
         )?;
         transaction.commit()?;
+        self.source_offsets
+            .insert(PathBuf::from(path), (offset, thread_id.to_owned()));
+        self.failed_sources.remove(Path::new(path));
+        for id in changed {
+            self.costs
+                .insert(id.clone(), CostMember::from_session(&self.sessions[id]));
+        }
         Ok(())
     }
 
@@ -620,35 +949,20 @@ impl Store {
     }
 }
 
-/// Discovery walks once on startup; ongoing updates arrive from OS file notifications.
-fn recent_files(root: &Path) -> Result<Vec<PathBuf>> {
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut files = Vec::new();
-    for entry in WalkDir::new(root).into_iter() {
-        let entry = entry?;
-        if is_rollout(entry.path()) && entry.file_type().is_file() {
-            let mut first = String::new();
-            BufReader::new(File::open(entry.path())?.take(1024 * 1024)).read_line(&mut first)?;
-            if let Ok(meta) = serde_json::from_str::<Value>(&first) {
-                let p = &meta["payload"];
-                let mut session = Session::default();
-                model::apply(
-                    &mut session,
-                    &serde_json::json!({"type":"session_meta","payload":p}),
-                );
-                if session.thread_kind != "internal" {
-                    files.push((
-                        entry.metadata()?.modified()?,
-                        entry.into_path(),
-                        session.id,
-                        session.parent_id,
-                    ));
-                }
-            }
-        }
-    }
+/// Choose recent full timelines while preserving ancestors; cost discovery has no such cap.
+fn recent_catalog_paths(catalog: &HashMap<PathBuf, CatalogEntry>) -> Vec<PathBuf> {
+    let mut files: Vec<_> = catalog
+        .iter()
+        .filter(|(_, entry)| entry.member.thread_kind != "internal")
+        .map(|(path, entry)| {
+            (
+                entry.modified,
+                path.clone(),
+                entry.member.id.clone(),
+                entry.member.parent_id.clone(),
+            )
+        })
+        .collect();
     files.sort_by_key(|(time, _, _, _)| std::cmp::Reverse(*time));
     let mut chosen = HashSet::new();
     let mut pending: Vec<_> = files
@@ -656,7 +970,6 @@ fn recent_files(root: &Path) -> Result<Vec<PathBuf>> {
         .take(MAX_SESSIONS)
         .map(|(_, _, id, _)| id.clone())
         .collect();
-    // Load missing ancestors before children so attached chats remain reachable in the sidebar.
     while let Some(id) = pending.pop() {
         if chosen.insert(id.clone()) {
             if let Some((_, _, _, parent)) = files.iter().find(|(_, _, own, _)| own == &id) {
@@ -671,11 +984,25 @@ fn recent_files(root: &Path) -> Result<Vec<PathBuf>> {
         .filter(|(_, _, id, _)| chosen.contains(id))
         .collect();
     selected.sort_by_key(|(_, _, _, parent)| !parent.is_empty());
-    Ok(selected
+    selected
         .into_iter()
         .take(MAX_SESSIONS)
         .map(|(_, path, _, _)| path)
-        .collect())
+        .collect()
+}
+
+#[cfg(test)]
+fn recent_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut catalog = HashMap::new();
+    for entry in WalkDir::new(root) {
+        let entry = entry?;
+        if is_rollout(entry.path()) && entry.file_type().is_file() {
+            if let Some(source) = catalog_entry(entry.path())? {
+                catalog.insert(entry.into_path(), source);
+            }
+        }
+    }
+    Ok(recent_catalog_paths(&catalog))
 }
 
 fn is_rollout(path: &Path) -> bool {
@@ -744,6 +1071,14 @@ fn run(
     let hooks_dir = home.join("monitor");
     let hooks = hooks_dir.join("hooks.jsonl");
     let mut store = Store::open(&db_path)?;
+    match coverage_migration::migrate(&mut store.db, &hooks) {
+        Ok(true) => {
+            drop(store);
+            store = Store::open(&db_path)?;
+        }
+        Ok(false) => (),
+        Err(error) => store.error = Some(format!("历史费用覆盖回填未完成：{error}")),
+    }
     let index = home.join("session_index.jsonl");
     store.load_titles(&index)?;
     let (event_tx, events) = mpsc::sync_channel(64);
@@ -751,7 +1086,8 @@ fn run(
     let mut watcher = watch_sources(&root, &hooks_dir, event_tx, overflow.clone())?;
     let mut queue = VecDeque::new();
     let mut queued = HashSet::new();
-    for path in recent_files(&root)?
+    for path in store
+        .discover(&root)?
         .into_iter()
         .chain(std::iter::once(hooks.clone()))
     {
@@ -764,22 +1100,13 @@ fn run(
         if !sessions_watched && root.is_dir() {
             watcher.watch(&root, RecursiveMode::Recursive)?;
             sessions_watched = true;
-            for path in recent_files(&root)? {
+            for path in store.discover(&root)? {
                 enqueue(path, &mut queue, &mut queued);
             }
         }
         if let Some(path) = queue.pop_front() {
             queued.remove(&path);
-            let result = if path == index {
-                store.load_titles(&path).map(|_| false)
-            } else {
-                store.ingest(&path)
-            };
-            match result {
-                Ok(true) => enqueue(path, &mut queue, &mut queued),
-                Ok(false) => (),
-                Err(error) => store.error = Some(format!("{}: {error}", path.display())),
-            }
+            process_queued(&mut store, path, &index, &mut queue, &mut queued);
             dirty = true;
         }
         if dirty && (queue.is_empty() || last_publish.elapsed() >= Duration::from_millis(250)) {
@@ -808,12 +1135,12 @@ fn run(
                     enqueue(hooks.clone(), &mut queue, &mut queued);
                 }
             }
-            handle_event(event, &hooks, &mut queue, &mut queued, &mut store);
-            dirty |= !queue.is_empty();
+            dirty |= handle_event(event, &hooks, &mut queue, &mut queued, &mut store);
         }
         if overflow.swap(false, Ordering::Relaxed) {
             store.error = Some("File event queue overflow: rediscovered recent sources".into());
-            for path in recent_files(&root)?
+            for path in store
+                .discover(&root)?
                 .into_iter()
                 .chain(std::iter::once(hooks.clone()))
             {
@@ -824,13 +1151,40 @@ fn run(
     }
 }
 
+/// Background history catch-up uses the same transactional cursor path as live file updates.
+fn process_queued(
+    store: &mut Store,
+    path: PathBuf,
+    index: &Path,
+    queue: &mut VecDeque<PathBuf>,
+    queued: &mut HashSet<PathBuf>,
+) {
+    let result = if path == index {
+        store.load_titles(&path).map(|_| false)
+    } else {
+        store.ingest(&path)
+    };
+    match result {
+        Ok(true) => enqueue(path, queue, queued),
+        Ok(false) => (),
+        Err(error) => {
+            store.error = Some(format!("{}: {error}", path.display()));
+            store.failed_sources.insert(path);
+        }
+    }
+    for path in store.pending_family_paths() {
+        enqueue(path, queue, queued);
+    }
+}
+
 fn handle_event(
     event: notify::Result<notify::Event>,
     hooks: &Path,
     queue: &mut VecDeque<PathBuf>,
     queued: &mut HashSet<PathBuf>,
     store: &mut Store,
-) {
+) -> bool {
+    let mut changed = false;
     match event {
         Ok(event) if !event.kind.is_access() => {
             for path in event.paths {
@@ -840,19 +1194,57 @@ fn handle_event(
                         .file_name()
                         .is_some_and(|name| name == "session_index.jsonl")
                 {
+                    store.failed_sources.remove(&path);
+                    store.attempted_sources.remove(&path);
+                    if !path.is_file() {
+                        store.catalog.remove(&path);
+                    }
                     enqueue(path, queue, queued);
+                    changed = true;
                 }
             }
         }
         Ok(_) => (),
-        Err(error) => store.error = Some(format!("File watcher: {error}")),
+        Err(error) => {
+            store.error = Some(format!("File watcher: {error}"));
+            changed = true;
+        }
     }
+    changed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    // A migrated agent hook replay must keep its agent identity and not create a duplicate request.
+    #[test]
+    fn migrated_agent_hook_replay_keeps_one_coverage_request() {
+        let dir = fixture("agent-coverage-replay");
+        let path = dir.join("hooks.jsonl");
+        let db = dir.join("state.sqlite");
+        let row = |name: &str, time: i64| {
+            serde_json::json!({"type":"monitor_hook","timestamp_ms":time,"payload":{
+                "thread_id":"child","turn_id":"turn","agent_id":"child-agent",
+                "hook_event_name":name,"status":"completed"}})
+            .to_string()
+                + "\n"
+        };
+        fs::write(
+            &path,
+            row("PreModelRequest", 1000) + &row("PostModelRequest", 2000),
+        )
+        .unwrap();
+        let mut store = Store::open(&db).unwrap();
+        assert!(coverage_migration::migrate(&mut store.db, &path).unwrap());
+        store.ingest(&path).unwrap();
+        let child = &store.sessions["child"];
+        assert_eq!(child.cost_coverage.len(), 1);
+        assert_eq!(child.cost_coverage_incomplete, Some(true));
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     fn fixture(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -862,6 +1254,264 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn write_cost_rollout(
+        dir: &Path,
+        file: &str,
+        id: &str,
+        parent: &str,
+        stamp: u64,
+        output: u64,
+    ) -> PathBuf {
+        let path = dir.join(format!("rollout-{file}.jsonl"));
+        let source = if parent.is_empty() {
+            serde_json::json!("vscode")
+        } else {
+            serde_json::json!({"subagent":{"parent_thread_id":parent}})
+        };
+        let records = [
+            serde_json::json!({"type":"session_meta","timestamp_ms":stamp,"payload":{"id":id,"source":source}}),
+            serde_json::json!({"type":"token_usage_record","timestamp_ms":stamp+1,"payload":{
+                "thread_id":id,"response_id":file,"model":"gpt-6.1-sol","turn_id":"turn",
+                "usage":{"input_tokens":10,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":output}}}),
+        ];
+        fs::write(
+            &path,
+            records
+                .into_iter()
+                .map(|record| record.to_string() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(stamp))
+            .unwrap();
+        path
+    }
+
+    // Historical child fees survive timeline eviction and restart; discovery catches uncached old children.
+    #[test]
+    fn historical_costs_outlive_the_full_session_limit() {
+        let dir = fixture("cost-history");
+        let child = write_cost_rollout(&dir, "child", "child", "parent", 100, 7);
+        let parent = write_cost_rollout(&dir, "parent", "parent", "", 10000, 3);
+        for index in 0..100 {
+            let id = format!("other-{index}");
+            write_cost_rollout(&dir, &id, &id, "", 1000 + index, 1);
+        }
+        let db = dir.join("state.sqlite");
+        let mut store = Store::open(&db).unwrap();
+        let paths = store.discover(&dir).unwrap();
+        assert!(paths.contains(&child));
+        assert!(paths.contains(&parent));
+        assert!(store.costs["child"].cost.is_none());
+        assert!(
+            store
+                .cost_snapshot()
+                .iter()
+                .find(|member| member.id == "child")
+                .unwrap()
+                .partial
+        );
+        for path in paths.into_iter().collect::<HashSet<_>>() {
+            store.ingest(&path).unwrap();
+        }
+        assert!(store.sessions.len() <= MAX_SESSIONS);
+        assert!(!store.sessions.contains_key("child"));
+        assert_eq!(store.costs["child"].cost.as_ref().unwrap().output_tokens, 7);
+        assert!(store.sources_complete("child"));
+        let offset = store.source_offsets[&child].0;
+        drop(store);
+        let mut store = Store::open(&db).unwrap();
+        assert!(!store.sessions.contains_key("child"));
+        store.discover(&dir).unwrap();
+        assert_eq!(store.costs["child"].cost.as_ref().unwrap().output_tokens, 7);
+        assert_eq!(store.source_offsets[&child].0, offset);
+        assert!(store.sources_complete("child"));
+        assert!(!store.ingest(&child).unwrap());
+        assert_eq!(store.costs["child"].cost.as_ref().unwrap().output_tokens, 7);
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Every known file must reach EOF; absent sources and failed reads preserve a partial total.
+    #[test]
+    fn cost_completeness_covers_all_sources() {
+        let dir = fixture("cost-sources");
+        let first = write_cost_rollout(&dir, "first", "child", "parent", 100, 7);
+        let second = write_cost_rollout(&dir, "second", "child", "parent", 200, 11);
+        let mut store = Store::open(&dir.join("state.sqlite")).unwrap();
+        store.discover(&dir).unwrap();
+        store.ingest(&first).unwrap();
+        assert!(!store.sources_complete("child"));
+        store.ingest(&second).unwrap();
+        assert!(store.sources_complete("child"));
+        assert_eq!(
+            store.costs["child"].cost.as_ref().unwrap().output_tokens,
+            18
+        );
+        store.failed_sources.insert(second.clone());
+        assert!(!store.sources_complete("child"));
+        store.failed_sources.clear();
+        fs::remove_file(&second).unwrap();
+        store.discover(&dir).unwrap();
+        assert!(!store.sources_complete("child"));
+        assert!(
+            store
+                .cost_snapshot()
+                .iter()
+                .find(|member| member.id == "child")
+                .unwrap()
+                .partial
+        );
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Repairing v8 ownership keeps fees, timestamps, cursor positions and unknown coverage intact.
+    #[test]
+    fn first_metadata_repairs_legacy_cache_without_replay() {
+        let dir = fixture("cost-metadata-repair");
+        let path = write_cost_rollout(&dir, "child", "child", "parent", 100, 7);
+        let db = dir.join("state.sqlite");
+        let mut store = Store::open(&db).unwrap();
+        store.ingest(&path).unwrap();
+        let offset = store.source_offsets[&path].0;
+        store.db.execute("UPDATE sessions SET state=json_remove(json_set(state,
+            '$.parent_id','','$.thread_kind','conversation'),'$.cost_coverage_incomplete') WHERE id='child'", []).unwrap();
+        drop(store);
+        let mut store = Store::open(&db).unwrap();
+        assert!(store.costs["child"].partial);
+        store.discover(&dir).unwrap();
+        assert_eq!(store.costs["child"].parent_id, "parent");
+        assert_eq!(store.sessions["child"].thread_kind, "subagent");
+        assert_eq!(store.costs["child"].cost.as_ref().unwrap().output_tokens, 7);
+        assert_eq!(store.source_offsets[&path].0, offset);
+        assert_eq!(store.sessions["child"].last_ms, 101);
+        drop(store);
+        let store = Store::open(&db).unwrap();
+        assert_eq!(store.costs["child"].parent_id, "parent");
+        assert_eq!(store.source_offsets[&path].0, offset);
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Conflicting and sparse same-thread files cannot replace established ownership or agent names.
+    #[test]
+    fn multiple_sources_only_supplement_missing_metadata() {
+        let dir = fixture("cost-metadata-conflict");
+        let first = write_cost_rollout(&dir, "first", "child", "parent", 100, 7);
+        let mut rows: Vec<Value> = fs::read_to_string(&first)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        rows[0]["payload"]["agent_nickname"] = serde_json::json!("Original");
+        fs::write(
+            &first,
+            rows.into_iter()
+                .map(|row| row.to_string() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        let db = dir.join("state.sqlite");
+        let mut store = Store::open(&db).unwrap();
+        store.ingest(&first).unwrap();
+        for (file, payload, stamp) in [
+            (
+                "conflicting",
+                serde_json::json!({"id":"child","source":"vscode",
+                "attached_thread":true,"forked_from_id":"foreign","agent_nickname":"Other"}),
+                200,
+            ),
+            (
+                "empty",
+                serde_json::json!({"id":"child","source":"vscode"}),
+                300,
+            ),
+        ] {
+            let path = dir.join(format!("rollout-{file}.jsonl"));
+            fs::write(
+                &path,
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                "type":"session_meta","timestamp_ms":stamp,"payload":payload})
+                ),
+            )
+            .unwrap();
+            store.ingest(&path).unwrap();
+            assert_eq!(store.costs["child"].parent_id, "parent");
+            assert_eq!(store.costs["child"].thread_kind, "subagent");
+            assert_eq!(store.costs["child"].agent_name, "Original");
+            assert_eq!(store.sessions["child"].parent_id, "parent");
+        }
+        assert_eq!(store.costs["child"].cost.as_ref().unwrap().output_tokens, 7);
+        drop(store);
+        let mut store = Store::open(&db).unwrap();
+        store.discover(&dir).unwrap();
+        assert_eq!(store.costs["child"].parent_id, "parent");
+        assert_eq!(store.costs["child"].thread_kind, "subagent");
+        assert_eq!(store.costs["child"].agent_name, "Original");
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // A partial JSONL tail waits for another file notification instead of creating a busy retry loop.
+    #[test]
+    fn history_queue_does_not_spin_on_partial_tails() {
+        let dir = fixture("cost-tail");
+        let path = write_cost_rollout(&dir, "child", "child", "parent", 100, 7);
+        File::options()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"type\":")
+            .unwrap();
+        let mut store = Store::open(&dir.join("state.sqlite")).unwrap();
+        store.discover(&dir).unwrap();
+        assert!(!store.ingest(&path).unwrap());
+        assert!(!store.sources_complete("child"));
+        assert!(!store.pending_family_paths().contains(&path));
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Failed SQLite commits cannot publish uncommitted fees or advance the persisted source cursor.
+    #[test]
+    fn rejected_commit_keeps_cost_index_and_cursor_unchanged() {
+        let dir = fixture("cost-transaction");
+        let path = write_cost_rollout(&dir, "child", "child", "parent", 100, 7);
+        let mut store = Store::open(&dir.join("state.sqlite")).unwrap();
+        store.ingest(&path).unwrap();
+        let offset = store.source_offsets[&path].0;
+        let row = serde_json::json!({"type":"token_usage_record","timestamp_ms":200,
+            "payload":{"thread_id":"child","response_id":"next","model":"gpt-6.1-sol",
+                "usage":{"input_tokens":10,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":99}}});
+        File::options()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all((row.to_string() + "\n").as_bytes())
+            .unwrap();
+        store.db.execute_batch("CREATE TRIGGER reject_cost BEFORE INSERT ON sessions BEGIN SELECT RAISE(ABORT,'test rejection'); END;").unwrap();
+        assert!(store.ingest(&path).is_err());
+        assert_eq!(store.costs["child"].cost.as_ref().unwrap().output_tokens, 7);
+        assert_eq!(store.sessions["child"].cost.output_tokens, 7);
+        assert_eq!(store.source_offsets[&path].0, offset);
+        assert!(!store.sources_complete("child"));
+        store.db.execute_batch("DROP TRIGGER reject_cost;").unwrap();
+        store.ingest(&path).unwrap();
+        assert_eq!(
+            store.costs["child"].cost.as_ref().unwrap().output_tokens,
+            106
+        );
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// A partial final record must survive restart without advancing its cursor.

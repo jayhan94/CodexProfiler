@@ -1,7 +1,7 @@
 use crate::collector;
 use crate::model::{
-    is_agent_tool, now_ms, AgentEvent, Compaction, CostSummary, ModelRequest, Session, Snapshot,
-    Tool,
+    is_agent_tool, now_ms, AgentEvent, Compaction, CostMember, CostSummary, ModelRequest, Session,
+    Snapshot, Tool,
 };
 use crate::stats::SessionStats;
 use crate::{pricing, resources, stats, theme};
@@ -371,6 +371,7 @@ impl eframe::App for Monitor {
                                 ui,
                                 s,
                                 &self.snapshot.sessions,
+                                &self.snapshot.costs,
                                 &mut self.filter,
                                 &mut self.timeline_search,
                             )
@@ -541,6 +542,7 @@ fn render_session(
     ui: &mut egui::Ui,
     s: &Session,
     sessions: &[Session],
+    costs: &[CostMember],
     filter: &mut Filter,
     search: &mut String,
 ) {
@@ -567,11 +569,11 @@ fn render_session(
             meta_line(ui, "目录", &s.cwd);
         });
     ui.add_space(18.0);
-    let totals = stats::rollup(s, sessions);
+    let totals = stats::rollup(s, sessions, costs);
     metrics(ui, s, &totals);
     cost_details(ui, s, &totals);
     ui.add_space(20.0);
-    render_timeline(ui, s, sessions, filter, search);
+    render_timeline(ui, s, sessions, costs, filter, search);
 }
 
 fn task_elapsed(s: &Session) -> Option<i64> {
@@ -584,7 +586,7 @@ fn task_elapsed(s: &Session) -> Option<i64> {
 }
 
 /// Cards keep primary metrics readable without placing large identity strings in the overview.
-fn metrics(ui: &mut egui::Ui, s: &Session, totals: &SessionStats<'_>) {
+fn metrics(ui: &mut egui::Ui, s: &Session, totals: &SessionStats) {
     let elapsed = task_elapsed(s);
     let tps = s
         .request_tps
@@ -620,13 +622,15 @@ fn metrics(ui: &mut egui::Ui, s: &Session, totals: &SessionStats<'_>) {
         ),
         (
             "会话 API 估算",
-            session_cost(&totals.cost),
+            group_cost(totals),
             if totals.missing_children > 0 {
-                format!("部分汇总 · {} 个子会话未加载", totals.missing_children)
+                format!("部分汇总 · {} 个子会话待补读", totals.missing_children)
+            } else if totals.incomplete_members > 0 {
+                format!("部分估算 · {} 个会话用量待核对", totals.incomplete_members)
             } else if totals.cost.unpriced_requests > 0 {
                 format!("部分估算 · {} 次未定价", totals.cost.unpriced_requests)
             } else if totals.members.len() > 1 {
-                format!("全部轮次 · 含 {} 个已加载子会话", totals.members.len() - 1)
+                format!("全部轮次 · 含 {} 个子会话", totals.members.len() - 1)
             } else {
                 "全部轮次 · 非订阅账单".into()
             },
@@ -776,6 +780,7 @@ fn render_timeline(
     ui: &mut egui::Ui,
     s: &Session,
     sessions: &[Session],
+    costs: &[CostMember],
     filter: &mut Filter,
     search: &mut String,
 ) {
@@ -815,7 +820,7 @@ fn render_timeline(
     }
     for row in rows.into_iter().take(300) {
         ui.push_id((&s.id, row.key()), |ui| {
-            timeline_card(ui, row, s, sessions, columns)
+            timeline_card(ui, row, s, sessions, costs, columns)
         });
         ui.add_space(5.0);
     }
@@ -900,6 +905,7 @@ fn timeline_card(
     row: TimelineRow<'_>,
     session: &Session,
     sessions: &[Session],
+    costs: &[CostMember],
     columns: Columns,
 ) {
     timeline_frame().show(ui, |ui| {
@@ -920,13 +926,13 @@ fn timeline_card(
                     tool_details(ui, t);
                     if is_agent_tool(t) {
                         if let Some(event) = session.agent_events.iter().find(|e| e.id == t.id) {
-                            agent_stats(ui, event, sessions);
+                            agent_stats(ui, event, sessions, costs);
                         }
                     }
                 }
                 TimelineRow::Agent(e) => {
                     agent_details(ui, e);
-                    agent_stats(ui, e, sessions);
+                    agent_stats(ui, e, sessions, costs);
                 }
                 TimelineRow::Model(r) => request_details(ui, r),
                 TimelineRow::Compaction(c) => compaction_details(ui, c, session),
@@ -1070,18 +1076,29 @@ fn agent_details(ui: &mut egui::Ui, event: &AgentEvent) {
 }
 
 /// Reuse the child overview; repeated timeline references never alter stored costs.
-fn agent_stats(ui: &mut egui::Ui, event: &AgentEvent, sessions: &[Session]) {
+fn agent_stats(ui: &mut egui::Ui, event: &AgentEvent, sessions: &[Session], costs: &[CostMember]) {
     ui.separator();
     let Some(child) = sessions
         .iter()
         .find(|s| !event.thread_id.is_empty() && s.id == event.thread_id)
     else {
-        ui.small("子会话尚未加载，暂时无法显示统计。");
+        ui.small("子会话当前轮次尚未加载，暂时无法显示速率和耗时。");
+        if let Some(member) = costs
+            .iter()
+            .find(|m| !event.thread_id.is_empty() && m.id == event.thread_id)
+        {
+            if let Some(cost) = &member.cost {
+                ui.label(format!(
+                    "子会话自身已记录费用 {}",
+                    member_cost(member, cost)
+                ));
+            }
+        }
         return;
     };
     ui.label(RichText::new("子会话当前统计").strong());
     ui.small("速率、耗时及输出对应子会话当前轮次；费用为全部轮次累计，已按归属汇总到父会话。");
-    let totals = stats::rollup(child, sessions);
+    let totals = stats::rollup(child, sessions, costs);
     metrics(ui, child, &totals);
     cost_details(ui, child, &totals);
 }
@@ -1178,8 +1195,26 @@ fn session_cost(cost: &CostSummary) -> String {
     }
 }
 
+fn member_cost(member: &CostMember, cost: &CostSummary) -> String {
+    if member.partial && cost.priced_requests > 0 {
+        format!("~{}", money(cost.total()))
+    } else {
+        session_cost(cost)
+    }
+}
+
+fn group_cost(totals: &SessionStats) -> String {
+    if (totals.missing_children > 0 || totals.incomplete_members > 0)
+        && totals.cost.priced_requests > 0
+    {
+        format!("~{}", money(totals.cost.total()))
+    } else {
+        session_cost(&totals.cost)
+    }
+}
+
 /// Show whole-chat owned costs, including descendants, without changing source usage records.
-fn cost_details(ui: &mut egui::Ui, s: &Session, totals: &SessionStats<'_>) {
+fn cost_details(ui: &mut egui::Ui, s: &Session, totals: &SessionStats) {
     let title = RichText::new("成本明细 · API / USD")
         .size(10.0)
         .color(theme::MUTED);
@@ -1195,11 +1230,14 @@ fn cost_details(ui: &mut egui::Ui, s: &Session, totals: &SessionStats<'_>) {
         if cost.unpriced_requests > 0 {
             ui.small("当前总额是部分估算，未定价请求未被计为 $0。");
         }
+        if totals.incomplete_members > 0 {
+            ui.small(format!("{} 个会话的费用记录尚未完整核对，当前为部分估算。", totals.incomplete_members));
+        }
         ui.small(format!("本会话本轮已观测：{} 次工具调用 · {} 次模型请求", s.tools.len(), s.requests.len()));
         if totals.members.len() > 1 || totals.missing_children > 0 {
             cost_ownership(ui, totals);
         }
-        let note = "全部轮次累计，含已加载的子智能体和侧边聊天，每个会话只计一次。API 等价估算，非订阅账单；30m 缓存写入。价格按每次请求档位调整，含已知长上下文规则；不含工具费用及区域附加费。";
+        let note = "全部轮次累计，含已记录的子智能体和侧边聊天，每个会话只计一次。API 等价估算，非订阅账单；30m 缓存写入。价格按每次请求档位调整，含已知长上下文规则；不含工具费用及区域附加费。";
         ui.label(RichText::new(note).small().color(theme::MUTED));
         ui.horizontal_wrapped(|ui| {
             ui.small(format!("价格快照 {}", pricing::AS_OF));
@@ -1209,7 +1247,7 @@ fn cost_details(ui: &mut egui::Ui, s: &Session, totals: &SessionStats<'_>) {
 }
 
 /// Itemize each member's own cost so nested children remain easy to reconcile without double counting.
-fn cost_ownership(ui: &mut egui::Ui, totals: &SessionStats<'_>) {
+fn cost_ownership(ui: &mut egui::Ui, totals: &SessionStats) {
     ui.separator();
     ui.strong("费用归属 · 各会话自身用量");
     egui::Grid::new("cost_ownership")
@@ -1219,17 +1257,32 @@ fn cost_ownership(ui: &mut egui::Ui, totals: &SessionStats<'_>) {
                 ui.label(if index == 0 {
                     "本会话自身".into()
                 } else {
-                    display_title(member)
+                    member_title(member)
                 });
-                ui.monospace(session_cost(&member.cost));
+                ui.monospace(
+                    member
+                        .cost
+                        .as_ref()
+                        .map_or_else(|| "待补读".into(), |cost| member_cost(member, cost)),
+                );
                 ui.end_row();
             }
         });
     if totals.missing_children > 0 {
         ui.small(format!(
-            "{} 个关联子会话尚未加载，当前为部分汇总。",
+            "{} 个关联子会话尚待补读，当前为部分汇总。",
             totals.missing_children
         ));
+    }
+}
+
+fn member_title(member: &CostMember) -> String {
+    if !member.title.trim().is_empty() {
+        member.title.clone()
+    } else if !member.agent_name.trim().is_empty() {
+        member.agent_name.clone()
+    } else {
+        format!("未命名会话 · {}", shortened(&member.id, 8))
     }
 }
 
@@ -1487,6 +1540,66 @@ fn shortened(value: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model;
+
+    // An unpriced child keeps the parent's known amount partial; late usage clears it after restart.
+    #[test]
+    fn parent_cost_marks_unmatched_child_and_recovers_when_usage_arrives() {
+        let mut parent = Session {
+            id: "parent".into(),
+            cost: CostSummary {
+                output_usd: 1.0,
+                priced_requests: 1,
+                ..CostSummary::default()
+            },
+            ..Session::default()
+        };
+        model::reset_cost_coverage(&mut parent);
+        let mut child = Session {
+            id: "child".into(),
+            parent_id: "parent".into(),
+            thread_kind: "subagent".into(),
+            turn_id: "first".into(),
+            ..Session::default()
+        };
+        model::reset_cost_coverage(&mut child);
+        for (name, timestamp) in [("PreModelRequest", 1000), ("PostModelRequest", 2000)] {
+            model::apply(
+                &mut child,
+                &serde_json::json!({"type":"monitor_hook","timestamp_ms":timestamp,
+                "payload":{"thread_id":"child","turn_id":"first","model":"gpt-6.1-sol",
+                    "hook_event_name":name,"status":"completed"}}),
+            );
+        }
+        let costs = [
+            CostMember::from_session(&parent),
+            CostMember::from_session(&child),
+        ];
+        let totals = stats::rollup(&parent, &[], &costs);
+        assert_eq!(totals.incomplete_members, 1);
+        assert_eq!(group_cost(&totals), "~$1.00");
+        model::apply(
+            &mut child,
+            &serde_json::json!({"type":"event_msg","timestamp_ms":3000,
+            "payload":{"type":"task_started","turn_id":"next"}}),
+        );
+        let mut restored: Session =
+            serde_json::from_str(&serde_json::to_string(&child).unwrap()).unwrap();
+        model::apply(
+            &mut restored,
+            &serde_json::json!({"type":"token_usage_record","timestamp_ms":1500,
+            "payload":{"thread_id":"child","turn_id":"first","response_id":"r1","model":"gpt-6.1-sol",
+                "usage":{"input_tokens":1000,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":100}}}),
+        );
+        let costs = [
+            CostMember::from_session(&parent),
+            CostMember::from_session(&restored),
+        ];
+        let totals = stats::rollup(&parent, &[], &costs);
+        assert_eq!(totals.incomplete_members, 0);
+        assert!(!group_cost(&totals).starts_with('~'));
+        assert_eq!(totals.cost.priced_requests, 2);
+    }
 
     // Agent details resolve the exact child ID, show its existing TPS/cost, and keep missing data unknown.
     #[test]
@@ -1522,7 +1635,11 @@ mod tests {
                 vec!["12.5", "321", "$2.00"],
                 vec!["99.9", "$99.00"],
             ),
-            ("missing", vec!["子会话尚未加载"], vec!["$0.00", "$2.00"]),
+            (
+                "missing",
+                vec!["子会话当前轮次尚未加载"],
+                vec!["$0.00", "$2.00"],
+            ),
         ] {
             let context = egui::Context::default();
             let event = AgentEvent {
@@ -1530,7 +1647,8 @@ mod tests {
                 ..AgentEvent::default()
             };
             let output = context.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| agent_stats(ui, &event, &sessions));
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| agent_stats(ui, &event, &sessions, &[]));
             });
             let text = output
                 .shapes

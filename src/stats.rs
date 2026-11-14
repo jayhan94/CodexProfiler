@@ -1,34 +1,43 @@
-use crate::model::{CostSummary, Session};
+use crate::model::{CostMember, CostSummary, Session};
 use std::collections::{HashMap, HashSet};
 
 /// A read-only view of a chat and its owned agent/side-chat descendants.
-pub struct SessionStats<'a> {
-    pub members: Vec<&'a Session>,
+pub struct SessionStats {
+    pub members: Vec<CostMember>,
     pub cost: CostSummary,
     pub missing_children: usize,
+    pub incomplete_members: usize,
 }
 
-/// Aggregate raw chat costs once per identity; ordinary conversation forks stay independent.
-pub fn rollup<'a>(root: &'a Session, sessions: &'a [Session]) -> SessionStats<'a> {
-    let mut children: HashMap<&str, Vec<&Session>> = HashMap::new();
-    let mut known: HashSet<&str> = sessions.iter().map(|session| session.id.as_str()).collect();
+/// Aggregate the persisted ownership index, including sessions outside the visible timeline cache.
+pub fn rollup(root: &Session, sessions: &[Session], costs: &[CostMember]) -> SessionStats {
+    // Tests and early snapshots may not have the index yet; keep known sessions available.
+    let fallback: Vec<_> = if costs.is_empty() {
+        sessions.iter().map(CostMember::from_session).collect()
+    } else {
+        Vec::new()
+    };
+    let source = if costs.is_empty() { &fallback } else { costs };
+    let mut children: HashMap<&str, Vec<&CostMember>> = HashMap::new();
+    let mut known: HashSet<&str> = source.iter().map(|member| member.id.as_str()).collect();
     known.insert(&root.id);
-    for session in sessions {
-        if matches!(session.thread_kind.as_str(), "subagent" | "side_chat") {
-            children
-                .entry(&session.parent_id)
-                .or_default()
-                .push(session);
+    for member in source {
+        if matches!(member.thread_kind.as_str(), "subagent" | "side_chat") {
+            children.entry(&member.parent_id).or_default().push(member);
         }
     }
-    let mut members = vec![root];
-    let mut seen: HashSet<&str> = HashSet::from([root.id.as_str()]);
+    let mut root_member = CostMember::from_session(root);
+    if let Some(indexed) = source.iter().find(|member| member.id == root.id) {
+        root_member.partial |= indexed.partial || indexed.cost.is_none();
+    }
+    let mut members = vec![root_member];
+    let mut seen = HashSet::from([root.id.clone()]);
     let mut cursor = 0;
     while cursor < members.len() {
         if let Some(descendants) = children.get(members[cursor].id.as_str()) {
             for child in descendants {
-                if seen.insert(&child.id) {
-                    members.push(child);
+                if seen.insert(child.id.clone()) {
+                    members.push((*child).clone());
                 }
             }
         }
@@ -37,18 +46,29 @@ pub fn rollup<'a>(root: &'a Session, sessions: &'a [Session]) -> SessionStats<'a
     members[1..].sort_by(|left, right| left.id.cmp(&right.id));
     let mut cost = CostSummary::default();
     let mut missing = HashSet::new();
-    for session in &members {
-        add_cost(&mut cost, &session.cost);
+    let mut incomplete_members = 0;
+    for member in &members {
+        if let Some(own) = &member.cost {
+            add_cost(&mut cost, own);
+            incomplete_members += usize::from(member.partial);
+        } else if member.id != root.id {
+            missing.insert(member.id.as_str());
+        }
+    }
+    for session in sessions.iter().filter(|session| seen.contains(&session.id)) {
         for event in &session.agent_events {
             if !event.thread_id.is_empty() && !known.contains(event.thread_id.as_str()) {
                 missing.insert(event.thread_id.as_str());
             }
         }
     }
+    let missing_children = missing.len();
+    drop(missing);
     SessionStats {
         members,
         cost,
-        missing_children: missing.len(),
+        missing_children,
+        incomplete_members,
     }
 }
 
@@ -116,7 +136,7 @@ mod tests {
             session("a-grandchild", "z-child", "side_chat", 3),
             session("root", "", "conversation", 1),
         ];
-        let stats = rollup(&root, &sessions);
+        let stats = rollup(&root, &sessions, &[]);
         assert_eq!(
             stats
                 .members
@@ -147,7 +167,7 @@ mod tests {
             session("fork-agent", "fork", "subagent", 3),
             session("plain-fork", "root", "fork", 4),
         ];
-        let stats = rollup(&root, &sessions);
+        let stats = rollup(&root, &sessions, &[]);
         assert_eq!(stats.members.len(), 1);
         assert_eq!(stats.cost.total(), root.cost.total());
     }
@@ -159,7 +179,7 @@ mod tests {
         root.agent_events = vec![event("child"), event("child"), event("child")];
         let child = session("child", "root", "subagent", 2);
         let sessions = vec![child.clone(), child];
-        let stats = rollup(&root, &sessions);
+        let stats = rollup(&root, &sessions, &[]);
         assert_eq!(stats.members.len(), 2);
         assert_eq!(stats.cost.uncached_usd, 3.0);
         assert_eq!(stats.missing_children, 0);
@@ -174,7 +194,7 @@ mod tests {
             session("foreign", "elsewhere", "subagent", 9),
             session("existing-conversation", "root", "conversation", 8),
         ];
-        let stats = rollup(&root, &sessions);
+        let stats = rollup(&root, &sessions, &[]);
         assert_eq!(stats.members.len(), 1);
         assert_eq!(stats.missing_children, 0);
         assert_eq!(stats.cost.input_tokens, 100);
@@ -188,7 +208,7 @@ mod tests {
         let mut child = session("child", "root", "side_chat", 2);
         child.agent_events = vec![event("missing"), event("missing-other"), event("root")];
         let sessions = vec![child];
-        let stats = rollup(&root, &sessions);
+        let stats = rollup(&root, &sessions, &[]);
         assert_eq!(stats.missing_children, 2);
         assert_eq!(stats.members.len(), 2);
     }
@@ -199,10 +219,63 @@ mod tests {
         let root = session("root", "", "conversation", 1);
         let sessions = vec![session("child", "root", "subagent", 2)];
         let before = serde_json::to_value((&root, &sessions)).unwrap();
-        let stats = rollup(&root, &sessions);
+        let stats = rollup(&root, &sessions, &[]);
         assert_eq!(stats.cost.output_tokens, 6);
         assert_eq!(root.output_tokens, 999);
         assert_eq!(root.request_tps, Some(77.0));
         assert_eq!(serde_json::to_value((&root, &sessions)).unwrap(), before);
+    }
+
+    // A new parent turn can clear timeline notices while the persisted child cost stays in the total.
+    #[test]
+    fn persisted_child_outside_recent_sessions_is_still_included() {
+        let mut root = session("root", "", "conversation", 1);
+        let child = session("child", "root", "subagent", 2);
+        root.agent_events = vec![event("child")];
+        let index = vec![
+            CostMember::from_session(&root),
+            CostMember::from_session(&child),
+        ];
+        crate::model::apply(
+            &mut root,
+            &serde_json::json!({"type":"event_msg","timestamp_ms":2000,
+            "payload":{"type":"task_started","turn_id":"next"}}),
+        );
+        assert!(root.agent_events.is_empty());
+        let stats = rollup(&root, &[], &index);
+        assert_eq!(stats.members.len(), 2);
+        assert_eq!(stats.cost.uncached_usd, 3.0);
+        assert_eq!(stats.missing_children, 0);
+    }
+
+    // A known but unread child remains partial, while a cached grandchild still contributes once.
+    #[test]
+    fn unread_intermediate_child_is_partial_without_hiding_known_descendants() {
+        let root = session("root", "", "conversation", 1);
+        let child = CostMember {
+            id: "child".into(),
+            parent_id: "root".into(),
+            thread_kind: "subagent".into(),
+            cost: None,
+            partial: true,
+            ..CostMember::default()
+        };
+        let grandchild = session("grandchild", "child", "subagent", 3);
+        let index = vec![child, CostMember::from_session(&grandchild)];
+        let stats = rollup(&root, &[], &index);
+        assert_eq!(stats.members.len(), 3);
+        assert_eq!(stats.cost.uncached_usd, 4.0);
+        assert_eq!(stats.missing_children, 1);
+    }
+
+    // An observed child with uncertain cost keeps the known amount but marks the group partial.
+    #[test]
+    fn incomplete_child_does_not_turn_unknown_cost_into_zero() {
+        let root = session("root", "", "conversation", 1);
+        let mut child = CostMember::from_session(&session("child", "root", "subagent", 2));
+        child.partial = true;
+        let stats = rollup(&root, &[], &[child]);
+        assert_eq!(stats.cost.uncached_usd, 3.0);
+        assert!(stats.incomplete_members >= 1);
     }
 }

@@ -5,6 +5,7 @@ use serde_json::Value;
 #[serde(default)]
 pub struct Snapshot {
     pub sessions: Vec<Session>,
+    pub costs: Vec<CostMember>,
     pub error: Option<String>,
     pub updated_ms: i64,
 }
@@ -39,6 +40,11 @@ pub struct Session {
     pub agent_events: Vec<AgentEvent>,
     pub requests: Vec<ModelRequest>,
     pub cost: CostSummary,
+    pub cost_coverage_incomplete: Option<bool>,
+    pub cost_coverage: Vec<CostCoverageRequest>,
+    pub cost_coverage_known: Vec<CostCoverageUsage>,
+    #[serde(skip)]
+    pub cost_coverage_runtime: CostCoverageRuntime,
     pub billing_seen: Vec<String>,
     pub billing_quotes: Vec<BillingQuote>,
     pub billing_models: Vec<(String, String)>,
@@ -163,6 +169,486 @@ pub struct CostSummary {
     pub unpriced_requests: u64,
 }
 
+/// Small persistent hook evidence, independent of the bounded current-turn timeline.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CostCoverageRequest {
+    key: String,
+    turn_id: String,
+    agent_id: String,
+    started_ms: Option<i64>,
+    ended_ms: Option<i64>,
+    response_id: Option<String>,
+    requires_usage: bool,
+    matched_response_id: Option<String>,
+}
+
+/// A canonical record's identity and scope survive eviction from the bounded price ledger.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CostCoverageUsage {
+    response_id: String,
+    turn_id: String,
+    timestamp_ms: i64,
+}
+
+/// Rebuilt once after deserialization; indexes never increase the persisted cache size.
+#[derive(Clone, Default)]
+pub struct CostCoverageRuntime {
+    requests: std::collections::HashMap<String, Vec<usize>>,
+    known: std::collections::HashMap<String, Vec<usize>>,
+    known_ids: std::collections::HashMap<String, usize>,
+    ended_ids: std::collections::HashMap<String, usize>,
+    indexed_requests: usize,
+    indexed_known: usize,
+    initialized: bool,
+    pending: usize,
+}
+
+/// Persisted cost and ownership without loading a session's timeline into the UI.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CostMember {
+    pub id: String,
+    pub parent_id: String,
+    pub thread_kind: String,
+    pub title: String,
+    pub agent_name: String,
+    pub cost: Option<CostSummary>,
+    pub partial: bool,
+}
+
+impl CostMember {
+    pub fn from_session(s: &Session) -> Self {
+        Self {
+            id: s.id.clone(),
+            parent_id: s.parent_id.clone(),
+            thread_kind: s.thread_kind.clone(),
+            title: s.title.clone(),
+            agent_name: s.agent_name.clone(),
+            cost: Some(s.cost.clone()),
+            partial: s.cost_coverage_incomplete != Some(false),
+        }
+    }
+}
+
+/// Only a new source or a complete historical hook scan can establish verified empty coverage.
+pub(crate) fn reset_cost_coverage(s: &mut Session) {
+    s.cost_coverage.clear();
+    s.cost_coverage_known.clear();
+    s.cost_coverage_incomplete = Some(false);
+    s.cost_coverage_runtime = CostCoverageRuntime {
+        initialized: true,
+        ..CostCoverageRuntime::default()
+    };
+}
+
+/// Move verified hook observations into the real cached session without touching its prices or metrics.
+pub(crate) fn copy_cost_coverage(target: &mut Session, observed: &Session) {
+    target.cost_coverage = observed.cost_coverage.clone();
+    target.cost_coverage_known = observed.cost_coverage_known.clone();
+    target.cost_coverage_incomplete = observed.cost_coverage_incomplete;
+    target.cost_coverage_runtime = CostCoverageRuntime::default();
+}
+
+fn index_cost_coverage(s: &mut Session) {
+    let runtime = &mut s.cost_coverage_runtime;
+    if runtime.indexed_requests > s.cost_coverage.len()
+        || runtime.indexed_known > s.cost_coverage_known.len()
+    {
+        *runtime = CostCoverageRuntime::default();
+    }
+    if !runtime.initialized {
+        runtime.pending = s
+            .cost_coverage
+            .iter()
+            .filter(|r| r.requires_usage && r.matched_response_id.is_none())
+            .count();
+        runtime.initialized = true;
+    }
+    for (index, request) in s
+        .cost_coverage
+        .iter()
+        .enumerate()
+        .skip(runtime.indexed_requests)
+    {
+        runtime
+            .requests
+            .entry(request.turn_id.clone())
+            .or_default()
+            .push(index);
+        if request.ended_ms.is_some() {
+            if let Some(id) = &request.response_id {
+                runtime.ended_ids.insert(id.clone(), index);
+            }
+        }
+    }
+    runtime.indexed_requests = s.cost_coverage.len();
+    for (index, usage) in s
+        .cost_coverage_known
+        .iter()
+        .enumerate()
+        .skip(runtime.indexed_known)
+    {
+        runtime
+            .known
+            .entry(usage.turn_id.clone())
+            .or_default()
+            .push(index);
+        runtime.known_ids.insert(usage.response_id.clone(), index);
+    }
+    runtime.indexed_known = s.cost_coverage_known.len();
+}
+
+fn update_coverage_flag(s: &mut Session) {
+    if s.cost_coverage_incomplete.is_some() {
+        s.cost_coverage_incomplete = Some(s.cost_coverage_runtime.pending > 0);
+    }
+}
+
+/// Record full hook rows before live-turn filtering so late prior-turn usage can settle them.
+pub(crate) fn observe_cost_coverage(s: &mut Session, row: &Value) {
+    record_cost_coverage(s, row);
+}
+
+fn record_cost_coverage(s: &mut Session, row: &Value) -> bool {
+    if !matches!(row["type"].as_str(), Some("monitor_hook" | "hook_event")) {
+        return false;
+    }
+    let p = &row["payload"];
+    if p["thread_id"]
+        .as_str()
+        .is_some_and(|id| !s.id.is_empty() && id != s.id)
+    {
+        return false;
+    }
+    let name = p["hook_event_name"].as_str().unwrap_or_default();
+    if !matches!(name, "PreModelRequest" | "PostModelRequest") {
+        return false;
+    }
+    index_cost_coverage(s);
+    let turn = text(p, "turn_id");
+    let agent = text(p, "agent_id");
+    let at = timestamp(row);
+    let response = p["response_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
+    if name == "PreModelRequest" {
+        let key = format!("pre:{turn}:{agent}:{at}");
+        if !s
+            .cost_coverage_runtime
+            .requests
+            .get(&turn)
+            .into_iter()
+            .flatten()
+            .any(|index| s.cost_coverage[*index].key == key)
+        {
+            s.cost_coverage.push(CostCoverageRequest {
+                key,
+                turn_id: turn,
+                agent_id: agent,
+                started_ms: Some(at),
+                response_id: response,
+                ..CostCoverageRequest::default()
+            });
+            return true;
+        }
+        return false;
+    }
+    if response
+        .as_ref()
+        .is_some_and(|id| s.cost_coverage_runtime.ended_ids.contains_key(id))
+        || s.cost_coverage_runtime
+            .requests
+            .get(&turn)
+            .into_iter()
+            .flatten()
+            .any(|index| {
+                let r = &s.cost_coverage[*index];
+                r.agent_id == agent && r.ended_ms == Some(at) && r.response_id == response
+            })
+    {
+        return false;
+    }
+    finish_cost_coverage(s, p, turn, agent, at, response);
+    true
+}
+
+fn finish_cost_coverage(
+    s: &mut Session,
+    p: &Value,
+    turn: String,
+    agent: String,
+    at: i64,
+    response: Option<String>,
+) {
+    let candidates: Vec<_> = s
+        .cost_coverage_runtime
+        .requests
+        .get(&turn)
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|index| {
+            let r = &s.cost_coverage[*index];
+            r.ended_ms.is_none()
+                && r.agent_id == agent
+                && r.started_ms.is_some_and(|start| start <= at)
+                && (response.is_none() || r.response_id.is_none() || r.response_id == response)
+        })
+        .collect();
+    let explicit = response.as_ref().and_then(|id| {
+        candidates
+            .iter()
+            .copied()
+            .find(|index| s.cost_coverage[*index].response_id.as_ref() == Some(id))
+    });
+    let index = explicit.or_else(|| {
+        if candidates.len() == 1 {
+            Some(candidates[0])
+        } else {
+            None
+        }
+    });
+    let index = index.unwrap_or_else(|| {
+        s.cost_coverage.push(CostCoverageRequest {
+            key: format!("post:{turn}:{agent}:{at}"),
+            turn_id: turn,
+            agent_id: agent,
+            ..CostCoverageRequest::default()
+        });
+        s.cost_coverage.len() - 1
+    });
+    let request = &mut s.cost_coverage[index];
+    let was_pending = request.requires_usage && request.matched_response_id.is_none();
+    request.ended_ms = Some(at);
+    request.response_id = response.or(request.response_id.take());
+    let completed = p["status"]
+        .as_str()
+        .is_none_or(|status| status == "completed");
+    let has_usage = p["token_usage"].as_object().is_some_and(|usage| {
+        usage
+            .values()
+            .any(|count| count.as_u64().is_some_and(|n| n > 0))
+    });
+    request.requires_usage = completed || has_usage;
+    let pending = request.requires_usage && request.matched_response_id.is_none();
+    if let Some(id) = &request.response_id {
+        s.cost_coverage_runtime.ended_ids.insert(id.clone(), index);
+    }
+    s.cost_coverage_runtime.pending = s
+        .cost_coverage_runtime
+        .pending
+        .saturating_sub(usize::from(was_pending))
+        + usize::from(pending);
+    update_coverage_flag(s);
+}
+
+/// A full refresh is reserved for historical backfill, not every tool notification.
+pub(crate) fn refresh_cost_coverage(s: &mut Session) {
+    refresh_coverage_scope(s, None);
+}
+
+fn coverage_known_in_scope(
+    s: &Session,
+    turn: Option<&str>,
+) -> std::collections::HashMap<String, CostCoverageUsage> {
+    use std::collections::{HashMap, HashSet};
+    let indices: Vec<_> = match turn {
+        None => (0..s.cost_coverage_known.len()).collect(),
+        Some("") => s
+            .cost_coverage_runtime
+            .requests
+            .get("")
+            .into_iter()
+            .flatten()
+            .filter_map(|index| s.cost_coverage[*index].response_id.as_ref())
+            .filter_map(|id| s.cost_coverage_runtime.known_ids.get(id).copied())
+            .collect(),
+        Some(turn) => s
+            .cost_coverage_runtime
+            .known
+            .get(turn)
+            .cloned()
+            .unwrap_or_default(),
+    };
+    let requested: HashSet<_> = s
+        .cost_coverage_runtime
+        .requests
+        .get("")
+        .into_iter()
+        .flatten()
+        .filter_map(|index| s.cost_coverage[*index].response_id.as_deref())
+        .collect();
+    let mut known: HashMap<_, _> = indices
+        .into_iter()
+        .map(|index| {
+            let usage = &s.cost_coverage_known[index];
+            (usage.response_id.clone(), usage.clone())
+        })
+        .collect();
+    for quote in &s.billing_quotes {
+        let include = match turn {
+            None => true,
+            Some("") => requested.contains(quote.response_id.as_str()),
+            Some(turn) => quote.turn_id == turn,
+        };
+        if include {
+            known
+                .entry(quote.response_id.clone())
+                .or_insert_with(|| CostCoverageUsage {
+                    response_id: quote.response_id.clone(),
+                    turn_id: quote.turn_id.clone(),
+                    timestamp_ms: quote.timestamp_ms,
+                });
+        }
+    }
+    known
+}
+
+fn coverage_request_scope(
+    s: &Session,
+    turn: Option<&str>,
+    known: &std::collections::HashMap<String, CostCoverageUsage>,
+) -> Vec<usize> {
+    let Some(turn) = turn else {
+        return (0..s.cost_coverage.len()).collect();
+    };
+    let mut indices = s
+        .cost_coverage_runtime
+        .requests
+        .get(turn)
+        .cloned()
+        .unwrap_or_default();
+    if !turn.is_empty() {
+        indices.extend(
+            s.cost_coverage_runtime
+                .requests
+                .get("")
+                .into_iter()
+                .flatten()
+                .filter(|index| {
+                    s.cost_coverage[**index]
+                        .response_id
+                        .as_ref()
+                        .is_some_and(|id| known.contains_key(id))
+                })
+                .copied(),
+        );
+    }
+    indices
+}
+
+/// Re-match only the affected turn; other turns retain their proven matches and pending count.
+fn refresh_coverage_scope(s: &mut Session, turn: Option<&str>) {
+    use std::collections::HashSet;
+    index_cost_coverage(s);
+    if turn.is_some_and(|turn| {
+        !s.cost_coverage_runtime.requests.contains_key(turn)
+            && !s.cost_coverage_runtime.requests.contains_key("")
+    }) {
+        return;
+    }
+    let known = coverage_known_in_scope(s, turn);
+    let indices = coverage_request_scope(s, turn, &known);
+    let (matches, claims) = {
+        let requests: Vec<_> = indices
+            .iter()
+            .map(|index| &s.cost_coverage[*index])
+            .collect();
+        anonymous_coverage_matches(&requests, &known)
+    };
+    let mut new_proofs = HashSet::new();
+    let mut old_pending = 0;
+    let mut new_pending = 0;
+    for (slot, index) in indices.into_iter().enumerate() {
+        let request = &mut s.cost_coverage[index];
+        old_pending += usize::from(request.requires_usage && request.matched_response_id.is_none());
+        request.matched_response_id = None;
+        if !request.requires_usage {
+            continue;
+        }
+        let proof = if let Some(id) = &request.response_id {
+            known
+                .get(id)
+                .filter(|usage| request.turn_id.is_empty() || request.turn_id == usage.turn_id)
+        } else {
+            matches[slot]
+                .as_ref()
+                .filter(|id| claims.get(*id) == Some(&1))
+                .and_then(|id| known.get(id))
+        };
+        if let Some(proof) = proof {
+            request.matched_response_id = Some(proof.response_id.clone());
+            if !s
+                .cost_coverage_runtime
+                .known_ids
+                .contains_key(&proof.response_id)
+                && new_proofs.insert(proof.response_id.clone())
+            {
+                s.cost_coverage_known.push(proof.clone());
+            }
+        } else {
+            new_pending += 1;
+        }
+    }
+    s.cost_coverage_runtime.pending =
+        s.cost_coverage_runtime.pending.saturating_sub(old_pending) + new_pending;
+    update_coverage_flag(s);
+}
+
+/// Anonymous intervals require unique proof in both directions; concurrent ambiguity stays partial.
+fn anonymous_coverage_matches(
+    requests: &[&CostCoverageRequest],
+    known: &std::collections::HashMap<String, CostCoverageUsage>,
+) -> (
+    Vec<Option<String>>,
+    std::collections::HashMap<String, usize>,
+) {
+    use std::collections::{HashMap, HashSet};
+    let reserved: HashSet<_> = requests
+        .iter()
+        .filter_map(|r| r.response_id.as_ref())
+        .collect();
+    let mut by_turn: HashMap<&str, Vec<&CostCoverageUsage>> = HashMap::new();
+    for usage in known.values() {
+        if !reserved.contains(&usage.response_id) {
+            by_turn.entry(&usage.turn_id).or_default().push(usage);
+        }
+    }
+    let mut matches = vec![None; requests.len()];
+    let mut claims = HashMap::new();
+    for (index, request) in requests.iter().enumerate() {
+        if !request.requires_usage || request.response_id.is_some() || request.turn_id.is_empty() {
+            continue;
+        }
+        let Some((start, end)) = request
+            .started_ms
+            .zip(request.ended_ms)
+            .filter(|(a, b)| *a > 0 && b >= a)
+        else {
+            continue;
+        };
+        let mut count = 0;
+        if let Some(usages) = by_turn.get(request.turn_id.as_str()) {
+            for usage in usages
+                .iter()
+                .filter(|u| u.timestamp_ms >= start && u.timestamp_ms <= end)
+            {
+                *claims.entry(usage.response_id.clone()).or_insert(0) += 1;
+                count += 1;
+                matches[index] = if count == 1 {
+                    Some(usage.response_id.clone())
+                } else {
+                    None
+                };
+            }
+        }
+    }
+    (matches, claims)
+}
+
 impl CostSummary {
     pub fn total(&self) -> f64 {
         self.uncached_usd + self.cached_usd + self.write_usd + self.output_usd
@@ -194,11 +680,24 @@ fn timestamp(row: &Value) -> i64 {
 pub fn apply(s: &mut Session, row: &Value) {
     let p = &row["payload"];
     let ts = timestamp(row);
+    // A hook may arrive before the transcript's first metadata record.
+    if s.id.is_empty() && matches!(row["type"].as_str(), Some("monitor_hook" | "hook_event")) {
+        if let Some(id) = p["thread_id"].as_str().filter(|id| !id.is_empty()) {
+            s.id = id.into();
+        }
+    }
+    if row["type"] == "session_meta" && ts > 0 && ts < s.last_ms {
+        supplement_metadata(s, row);
+        return;
+    }
+    if record_cost_coverage(s, row) {
+        refresh_coverage_scope(s, Some(p["turn_id"].as_str().unwrap_or_default()));
+    }
     // Billing follows canonical response ownership, independently of the displayed latest turn.
     remember_billing_model(s, row);
     observe_service_tier(s, row, ts);
-    if row["type"] == "token_usage_record" {
-        account_usage(s, p, ts);
+    if row["type"] == "token_usage_record" && account_usage(s, p, ts) {
+        refresh_coverage_scope(s, Some(p["turn_id"].as_str().unwrap_or_default()));
     }
     if ts > 0 && ts < s.last_ms {
         // Multiple sources can deliver boundaries late; retain timing without rewinding status.
@@ -784,18 +1283,18 @@ fn usage_model<'a>(s: &'a Session, p: &'a Value) -> &'a str {
 }
 
 /// Source cursors guarantee replay continuity; this recent-ID guard also rejects duplicate records.
-fn account_usage(s: &mut Session, p: &Value, ts: i64) {
+fn account_usage(s: &mut Session, p: &Value, ts: i64) -> bool {
     if p["thread_id"]
         .as_str()
         .is_some_and(|owner| !s.id.is_empty() && owner != s.id)
     {
-        return;
+        return false;
     }
     let Some(id) = p["response_id"].as_str().filter(|id| !id.is_empty()) else {
-        return;
+        return false;
     };
     if s.billing_seen.iter().any(|seen| seen == id) {
-        return;
+        return false;
     }
     s.billing_seen.push(id.into());
     if s.billing_seen.len() > 2048 {
@@ -846,6 +1345,7 @@ fn account_usage(s: &mut Session, p: &Value, ts: i64) {
     } else {
         s.cost.unpriced_requests += 1;
     }
+    true
 }
 
 fn quote_price(quote: &BillingQuote) -> Option<crate::pricing::CostBreakdown> {
@@ -1055,6 +1555,42 @@ fn hook(s: &mut Session, p: &Value, ts: i64) {
             s.phase = "已结束".into();
         }
         _ => {}
+    }
+}
+
+// Late transcript metadata can fill identity gaps without rewinding a live hook-derived session.
+pub(crate) fn supplement_metadata(s: &mut Session, row: &Value) {
+    let p = &row["payload"];
+    let Some(id) = p["id"].as_str().filter(|id| !id.is_empty()) else {
+        return;
+    };
+    if !s.id.is_empty() && s.id != id {
+        return;
+    }
+    if [row["thread_id"].as_str(), p["thread_id"].as_str()]
+        .into_iter()
+        .flatten()
+        .any(|routed| routed != id)
+    {
+        return;
+    }
+    let mut candidate = Session::default();
+    metadata(&mut candidate, p);
+    if s.id.is_empty() {
+        s.id = candidate.id;
+    }
+    if s.cwd.is_empty() {
+        s.cwd = candidate.cwd;
+    }
+    if s.parent_id.is_empty() {
+        s.parent_id = candidate.parent_id;
+    }
+    if s.agent_name.is_empty() {
+        s.agent_name = candidate.agent_name;
+    }
+    if s.thread_kind.is_empty() {
+        s.thread_kind = candidate.thread_kind;
+        s.is_internal |= candidate.is_internal;
     }
 }
 
@@ -2260,5 +2796,363 @@ mod tests {
         assert_eq!(agent.thread_kind, "subagent");
         assert_eq!(agent.parent_id, "parent");
         assert_eq!(agent.agent_name, "Helper");
+    }
+
+    // A newer hook binds the chat while late transcript metadata supplies its missing relationship.
+    #[test]
+    fn late_metadata_fills_child_identity_without_rewinding_live_state() {
+        let mut s = Session::default();
+        apply(
+            &mut s,
+            &json!({"type":"monitor_hook","timestamp_ms":3000,
+            "payload":{"thread_id":"child","turn_id":"live-turn",
+                "hook_event_name":"UserPromptSubmit","model":"live-model"}}),
+        );
+        let phase = s.phase.clone();
+        apply(
+            &mut s,
+            &json!({"type":"session_meta","timestamp_ms":1000,
+            "thread_id":"child","payload":{"id":"child","cwd":"D:/project",
+                "source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent",
+                    "agent_nickname":"Alice","agent_path":"/root/review"}}}}}),
+        );
+        assert_eq!(s.id, "child");
+        assert_eq!(s.cwd, "D:/project");
+        assert_eq!(s.parent_id, "parent");
+        assert_eq!(s.thread_kind, "subagent");
+        assert_eq!(s.agent_name, "Alice · review");
+        assert!(s.is_internal);
+        assert_eq!(s.phase, phase);
+        assert_eq!(s.turn_id, "live-turn");
+        assert_eq!(s.model, "live-model");
+        assert_eq!(s.last_ms, 3000);
+        assert_eq!(s.started_ms, Some(3000));
+    }
+
+    // Late metadata is supplementary: known relationships and workspace/name choices remain authoritative.
+    #[test]
+    fn late_metadata_preserves_known_identity_fields() {
+        let mut s = Session {
+            id: "child".into(),
+            cwd: "D:/current".into(),
+            parent_id: "known-parent".into(),
+            thread_kind: "side_chat".into(),
+            agent_name: "Known name".into(),
+            model: "current-model".into(),
+            phase: "current phase".into(),
+            turn_id: "current-turn".into(),
+            last_ms: 3000,
+            ..Session::default()
+        };
+        apply(
+            &mut s,
+            &json!({"type":"session_meta","timestamp_ms":1000,
+            "payload":{"id":"child","cwd":"D:/old","agent_nickname":"Old name",
+                "source":{"subagent":{"parent_thread_id":"old-parent"}}}}),
+        );
+        assert_eq!(s.parent_id, "known-parent");
+        assert_eq!(s.thread_kind, "side_chat");
+        assert_eq!(s.agent_name, "Known name");
+        assert_eq!(s.cwd, "D:/current");
+        assert!(!s.is_internal);
+        assert_eq!(s.model, "current-model");
+        assert_eq!(s.phase, "current phase");
+        assert_eq!(s.turn_id, "current-turn");
+        assert_eq!(s.last_ms, 3000);
+    }
+
+    // A copied parent record or mismatched source route must not supply a child's missing fields.
+    #[test]
+    fn late_metadata_rejects_other_chat_and_route() {
+        for (id, route, payload_route) in [
+            ("parent", "parent", "parent"),
+            ("child", "parent", "child"),
+            ("child", "child", "parent"),
+        ] {
+            let mut s = Session {
+                id: "child".into(),
+                last_ms: 3000,
+                ..Session::default()
+            };
+            apply(
+                &mut s,
+                &json!({"type":"session_meta","timestamp_ms":1000,
+                "thread_id":route,"payload":{"id":id,"thread_id":payload_route,
+                    "cwd":"D:/wrong","source":{"subagent":{"parent_thread_id":"wrong-parent"}}}}),
+            );
+            assert_eq!(s.id, "child");
+            assert!(s.cwd.is_empty());
+            assert!(s.parent_id.is_empty());
+            assert!(s.thread_kind.is_empty());
+            assert_eq!(s.last_ms, 3000);
+        }
+    }
+
+    // Metadata delivered normally continues through the existing classification path.
+    #[test]
+    fn normal_metadata_still_sets_side_chat_relationship() {
+        let mut s = Session::default();
+        apply(
+            &mut s,
+            &json!({"type":"session_meta","timestamp_ms":1000,
+            "payload":{"id":"side","cwd":"D:/project","source":"vscode",
+                "attached_thread":true,"forked_from_id":"parent","agent_nickname":"Side"}}),
+        );
+        assert_eq!(s.id, "side");
+        assert_eq!(s.parent_id, "parent");
+        assert_eq!(s.thread_kind, "side_chat");
+        assert_eq!(s.agent_name, "Side");
+        assert!(!s.is_internal);
+        assert_eq!(s.last_ms, 1000);
+    }
+
+    fn coverage_session() -> Session {
+        let mut s = Session {
+            id: "chat".into(),
+            ..Session::default()
+        };
+        reset_cost_coverage(&mut s);
+        billing_turn(&mut s, "one", "gpt-6.1-sol", 800);
+        s
+    }
+
+    // A loaded hook-only child cannot contribute a seemingly complete zero-dollar cost.
+    #[test]
+    fn hook_only_child_has_unknown_cost_coverage() {
+        let mut s = coverage_session();
+        s.parent_id = "parent".into();
+        s.thread_kind = "subagent".into();
+        request_event(&mut s, 1000, "PreModelRequest");
+        assert!(!CostMember::from_session(&s).partial);
+        request_event(&mut s, 1200, "PostModelRequest");
+        assert_eq!(s.cost_coverage_incomplete, Some(true));
+        assert!(CostMember::from_session(&s).partial);
+        assert_eq!(s.cost.priced_requests, 0);
+        assert_eq!(s.cost.unpriced_requests, 0);
+    }
+
+    // Canonical usage and terminal hooks settle identically in either source-delivery order.
+    #[test]
+    fn coverage_settles_usage_before_or_after_post_hook() {
+        for usage_first in [false, true] {
+            let mut s = coverage_session();
+            request_event(&mut s, 1000, "PreModelRequest");
+            let canonical = priced_record("r1", "one", 1100, 1000, 0, 0, 100);
+            if usage_first {
+                apply(&mut s, &canonical);
+            }
+            request_event(&mut s, 1200, "PostModelRequest");
+            if !usage_first {
+                assert!(CostMember::from_session(&s).partial);
+                apply(&mut s, &canonical);
+            }
+            assert_eq!(s.cost_coverage_incomplete, Some(false));
+            assert!(!CostMember::from_session(&s).partial);
+            assert_eq!(s.cost.priced_requests, 1);
+        }
+    }
+
+    // New turns and serialized restart retain missing coverage until late old-turn canonical usage arrives.
+    #[test]
+    fn coverage_survives_turn_reset_and_restart() {
+        let mut s = coverage_session();
+        request_event(&mut s, 1000, "PreModelRequest");
+        request_event(&mut s, 1200, "PostModelRequest");
+        billing_turn(&mut s, "two", "gpt-6.1-sol", 2000);
+        let mut restored: Session =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(CostMember::from_session(&restored).partial);
+        apply(
+            &mut restored,
+            &priced_record("r1", "one", 1100, 1000, 0, 0, 100),
+        );
+        assert_eq!(restored.turn_id, "two");
+        assert_eq!(restored.cost_coverage_incomplete, Some(false));
+        assert_eq!(restored.cost.priced_requests, 1);
+    }
+
+    // Failed/cancelled requests without any reported usage do not invent missing billable work.
+    #[test]
+    fn failed_without_usage_has_no_coverage_gap() {
+        for status in ["failed", "cancelled"] {
+            let mut s = coverage_session();
+            request_event(&mut s, 1000, "PreModelRequest");
+            apply(
+                &mut s,
+                &json!({"type":"monitor_hook","timestamp_ms":1200,
+                "payload":{"turn_id":"one","hook_event_name":"PostModelRequest","status":status,"token_usage":null}}),
+            );
+            assert_eq!(s.cost_coverage_incomplete, Some(false));
+            assert!(!CostMember::from_session(&s).partial);
+        }
+    }
+
+    // Repeated hooks and canonical rows remain one evidence record and one financial charge.
+    #[test]
+    fn coverage_duplicate_hooks_do_not_double_count() {
+        let mut s = coverage_session();
+        for _ in 0..2 {
+            request_event(&mut s, 1000, "PreModelRequest");
+        }
+        for _ in 0..2 {
+            request_event(&mut s, 1200, "PostModelRequest");
+        }
+        let usage = priced_record("r1", "one", 1100, 1000, 0, 0, 100);
+        apply(&mut s, &usage);
+        apply(&mut s, &usage);
+        assert_eq!(s.cost_coverage.len(), 1);
+        assert_eq!(s.cost_coverage_known.len(), 1);
+        assert_eq!(s.cost_coverage_incomplete, Some(false));
+        assert_eq!(s.cost.priced_requests, 1);
+    }
+
+    // Equal concurrent counts cannot establish response ownership when anonymous intervals overlap.
+    #[test]
+    fn concurrent_anonymous_coverage_stays_partial_when_ambiguous() {
+        let mut s = coverage_session();
+        for (agent, name, ts) in [
+            ("a", "PreModelRequest", 1000),
+            ("b", "PreModelRequest", 1100),
+            ("a", "PostModelRequest", 1300),
+            ("b", "PostModelRequest", 1400),
+        ] {
+            apply(
+                &mut s,
+                &json!({"type":"monitor_hook","timestamp_ms":ts,
+                "payload":{"turn_id":"one","agent_id":agent,"hook_event_name":name,"status":"completed"}}),
+            );
+        }
+        for (id, ts) in [("r1", 1200), ("r2", 1250)] {
+            apply(&mut s, &priced_record(id, "one", ts, 1000, 0, 0, 100));
+        }
+        assert_eq!(s.cost.priced_requests, 2);
+        assert_eq!(s.cost_coverage_incomplete, Some(true));
+        assert!(s
+            .cost_coverage
+            .iter()
+            .all(|request| request.matched_response_id.is_none()));
+    }
+
+    // A terminal hook without Pre needs an explicit response ID; matching only turn counts is unsafe.
+    #[test]
+    fn partial_hook_stream_requires_explicit_identity() {
+        for response in [Some("r1"), None] {
+            let mut s = coverage_session();
+            apply(&mut s, &priced_record("r1", "one", 1100, 1000, 0, 0, 100));
+            let mut hook = json!({"type":"monitor_hook","timestamp_ms":1200,
+                "payload":{"turn_id":"one","hook_event_name":"PostModelRequest","status":"completed"}});
+            if let Some(id) = response {
+                hook["payload"]["response_id"] = json!(id);
+            }
+            apply(&mut s, &hook);
+            assert_eq!(s.cost_coverage_incomplete, Some(response.is_none()));
+        }
+    }
+
+    // Previously verified canonical evidence remains valid after the bounded pricing ledger evicts it.
+    #[test]
+    fn verified_coverage_survives_price_ledger_eviction() {
+        let mut s = coverage_session();
+        request_event(&mut s, 1000, "PreModelRequest");
+        apply(&mut s, &priced_record("r1", "one", 1100, 1000, 0, 0, 100));
+        request_event(&mut s, 1200, "PostModelRequest");
+        s.billing_quotes.clear();
+        refresh_cost_coverage(&mut s);
+        assert_eq!(s.cost_coverage_incomplete, Some(false));
+        assert_eq!(
+            s.cost_coverage[0].matched_response_id.as_deref(),
+            Some("r1")
+        );
+    }
+
+    // Legacy snapshots remain explicitly uncertain until a verified historical scan establishes coverage.
+    #[test]
+    fn legacy_coverage_is_not_silently_complete() {
+        let mut s = Session::default();
+        assert_eq!(s.cost_coverage_incomplete, None);
+        assert!(CostMember::from_session(&s).partial);
+        refresh_cost_coverage(&mut s);
+        assert!(CostMember::from_session(&s).partial);
+        reset_cost_coverage(&mut s);
+        refresh_cost_coverage(&mut s);
+        assert!(!CostMember::from_session(&s).partial);
+    }
+
+    // Historical hook evidence can be transferred independently of current turn state and prices.
+    #[test]
+    fn copying_coverage_does_not_touch_session_cost_or_identity() {
+        let mut observed = coverage_session();
+        request_event(&mut observed, 1000, "PreModelRequest");
+        request_event(&mut observed, 1200, "PostModelRequest");
+        let mut target = coverage_session();
+        apply(
+            &mut target,
+            &priced_record("r1", "one", 1100, 1000, 0, 0, 100),
+        );
+        let before = serde_json::to_value(&target.cost).unwrap();
+        target.parent_id = "owned-parent".into();
+        copy_cost_coverage(&mut target, &observed);
+        refresh_cost_coverage(&mut target);
+        assert_eq!(serde_json::to_value(&target.cost).unwrap(), before);
+        assert_eq!(target.parent_id, "owned-parent");
+        assert_eq!(target.cost_coverage_incomplete, Some(false));
+    }
+
+    // Updating a new turn leaves earlier verified proof intact even after its price quote was evicted.
+    #[test]
+    fn new_turn_refresh_preserves_old_turn_coverage_proof() {
+        let mut s = coverage_session();
+        request_event(&mut s, 1000, "PreModelRequest");
+        apply(&mut s, &priced_record("r1", "one", 1100, 1000, 0, 0, 100));
+        request_event(&mut s, 1200, "PostModelRequest");
+        let old = serde_json::to_value(&s.cost_coverage[0]).unwrap();
+        s.billing_quotes.clear();
+        billing_turn(&mut s, "two", "gpt-6.1-sol", 2000);
+        for (name, ts) in [("PreModelRequest", 2100), ("PostModelRequest", 2400)] {
+            apply(
+                &mut s,
+                &json!({"type":"monitor_hook","timestamp_ms":ts,
+                "payload":{"turn_id":"two","hook_event_name":name,"status":"completed"}}),
+            );
+        }
+        assert_eq!(serde_json::to_value(&s.cost_coverage[0]).unwrap(), old);
+        assert_eq!(s.cost_coverage_incomplete, Some(true));
+        apply(&mut s, &priced_record("r2", "two", 2300, 1000, 0, 0, 100));
+        assert_eq!(s.cost_coverage_incomplete, Some(false));
+        assert_eq!(serde_json::to_value(&s.cost_coverage[0]).unwrap(), old);
+    }
+
+    // Tool hooks and duplicate canonical rows do not rebuild the runtime coverage index or proofs.
+    #[test]
+    fn unrelated_hooks_and_duplicate_usage_skip_coverage_work() {
+        let mut s = coverage_session();
+        request_event(&mut s, 1000, "PreModelRequest");
+        let usage = priced_record("r1", "one", 1100, 1000, 0, 0, 100);
+        apply(&mut s, &usage);
+        request_event(&mut s, 1200, "PostModelRequest");
+        let proof = serde_json::to_value(&s.cost_coverage).unwrap();
+        let indexed = s.cost_coverage_runtime.indexed_known;
+        apply(
+            &mut s,
+            &json!({"type":"monitor_hook","timestamp_ms":1300,
+            "payload":{"turn_id":"one","hook_event_name":"PreToolUse","tool_use_id":"tool"}}),
+        );
+        apply(&mut s, &usage);
+        assert_eq!(s.cost_coverage_runtime.indexed_known, indexed);
+        assert_eq!(serde_json::to_value(&s.cost_coverage).unwrap(), proof);
+        assert_eq!(s.cost_coverage_incomplete, Some(false));
+    }
+
+    // Foreign usage must not settle a local pending request during the scoped refresh path.
+    #[test]
+    fn foreign_thread_usage_does_not_clear_pending_coverage() {
+        let mut s = coverage_session();
+        request_event(&mut s, 1000, "PreModelRequest");
+        request_event(&mut s, 1200, "PostModelRequest");
+        let mut usage = priced_record("r1", "one", 1100, 1000, 0, 0, 100);
+        usage["payload"]["thread_id"] = json!("foreign");
+        apply(&mut s, &usage);
+        assert_eq!(s.cost_coverage_incomplete, Some(true));
+        assert_eq!(s.cost.priced_requests, 0);
     }
 }
