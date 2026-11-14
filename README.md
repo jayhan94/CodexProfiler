@@ -49,14 +49,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -NoLaunch
 固定版本、自定义路径和 Codex 主目录：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Version v0.2.0 -InstallDir "D:\Apps\CodexProfiler" -CodexHome "D:\Codex Home"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Version v0.2.1 -InstallDir "D:\Apps\CodexProfiler" -CodexHome "D:\Codex Home"
 ```
 
 参数：
 
 | 参数 | 用途 |
 | --- | --- |
-| `-Version latest` | 默认安装最新正式版；也可以指定 `v0.2.0` |
+| `-Version latest` | 默认安装最新正式版；也可以指定 `v0.2.1` |
 | `-InstallDir PATH` | 指定用户可写的安装目录 |
 | `-CodexHome PATH` | 指定要监控和导入 hooks 的 Codex 主目录 |
 | `-NoLaunch` | 安装后不启动窗口 |
@@ -70,8 +70,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Version v0.2.
 从 [Releases](https://github.com/jayhan94/CodexProfiler/releases) 下载 ZIP、`SHA256SUMS` 和 `install.ps1`，放在同一个目录：
 
 ```powershell
-Get-FileHash .\CodexProfiler-v0.2.0-windows-x64.zip -Algorithm SHA256
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -PackagePath .\CodexProfiler-v0.2.0-windows-x64.zip -NoLaunch
+Get-FileHash .\CodexProfiler-v0.2.1-windows-x64.zip -Algorithm SHA256
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -PackagePath .\CodexProfiler-v0.2.1-windows-x64.zip -NoLaunch
 ```
 
 校验失败会停止安装。安装器会拒绝覆盖一个没有安装清单的非空目录；请为首次安装选择新的空目录。当前发行包未进行 Windows 代码签名；下载来源和校验文件均以本仓库 Releases 为准。

@@ -338,10 +338,7 @@ impl eframe::App for Monitor {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG).inner_margin(22))
             .show(ctx, |ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.selectable_value(&mut self.page, Page::Processes, "进程资源");
-                    ui.selectable_value(&mut self.page, Page::Sessions, "会话分析");
-                });
+                page_tabs(ui, &mut self.page);
                 ui.add_space(12.0);
                 self.resources.set_visible(self.page == Page::Processes);
                 if self.page == Page::Processes {
@@ -373,6 +370,16 @@ impl eframe::App for Monitor {
                 }
             });
     }
+}
+
+/// Constrain navigation to one row so it cannot consume the content viewport height.
+fn page_tabs(ui: &mut egui::Ui, page: &mut Page) {
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.selectable_value(page, Page::Processes, "进程资源");
+            ui.selectable_value(page, Page::Sessions, "会话分析");
+        });
+    });
 }
 
 fn brand(ui: &mut egui::Ui) {
@@ -1311,6 +1318,26 @@ fn shortened(value: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Navigation must leave space for overview and resources at normal and compact heights.
+    #[test]
+    fn page_navigation_leaves_content_near_top() {
+        for height in [480.0, 900.0] {
+            let context = egui::Context::default();
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, height))),
+                ..Default::default()
+            };
+            let _ = context.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    page_tabs(ui, &mut Page::Sessions);
+                    let content = ui.label("overview").rect;
+                    assert!(content.top() < 60.0, "content displaced: {content:?}");
+                    assert!(ui.available_height() > height - 100.0);
+                });
+            });
+        }
+    }
 
     // Narrow and wide layouts must align the heading with the frame's actual row content.
     #[test]
