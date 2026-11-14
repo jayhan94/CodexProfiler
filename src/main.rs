@@ -3,6 +3,7 @@
 mod billing;
 mod collector;
 mod coverage_migration;
+mod effort_backfill;
 mod hook;
 mod model;
 mod pricing;

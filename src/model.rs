@@ -1128,6 +1128,36 @@ fn request_effort(s: &Session, p: &Value, start: Option<i64>) -> (Option<String>
         .unwrap_or_default()
 }
 
+/// Historical display repair fills only unknown start snapshots and never changes billing or phase.
+pub(crate) fn supplement_reasoning_history(s: &mut Session, history: &[(i64, Option<String>)]) {
+    for entry in history {
+        if !s.effort_history.contains(entry) {
+            s.effort_history.push(entry.clone());
+        }
+    }
+    s.effort_history.sort_by_key(|(time, _)| *time);
+    let remove = s.effort_history.len().saturating_sub(512);
+    s.effort_history.drain(..remove);
+    for request in s.requests.iter_mut().chain(
+        s.timeline_history
+            .iter_mut()
+            .flat_map(|turn| &mut turn.requests),
+    ) {
+        if request.reasoning_effort.is_some() || request.reasoning_effort_source == "request" {
+            continue;
+        }
+        if let Some((_, effort)) = request.started_ms.and_then(|start| {
+            s.effort_history
+                .iter()
+                .rev()
+                .find(|(time, _)| *time <= start)
+        }) {
+            request.reasoning_effort = effort.clone();
+            request.reasoning_effort_source = "settings".into();
+        }
+    }
+}
+
 /// Chunked sources may deliver settings late; re-evaluate inferred tiers at each observed start.
 fn reconcile_service_history(s: &mut Session) {
     for index in 0..s.requests.len() {

@@ -1,7 +1,7 @@
 use crate::billing::{Decision, ReceiptKey};
 use crate::model::{self, CostMember, CostSummary, Session, Snapshot, SourceNotice};
 use crate::source_state::{IssueKind, SourceIssue};
-use crate::{billing, coverage_migration, source_state};
+use crate::{billing, coverage_migration, effort_backfill, source_state};
 use eframe::egui;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -983,6 +983,22 @@ impl Store {
         Ok(())
     }
 
+    /// Reload only after effort JSON patches were committed, preserving fresh concurrent billing state.
+    fn restore_effort(&mut self, home: &Path) -> Result<()> {
+        let visible_ids: Vec<_> = self.sessions.keys().cloned().collect();
+        match effort_backfill::restore(&mut self.db, home, &visible_ids) {
+            Ok(true) => {
+                for id in visible_ids {
+                    self.sessions.remove(&id);
+                    self.ensure_session(&id)?;
+                }
+            }
+            Ok(false) => (),
+            Err(error) => self.error = Some(format!("历史 Think 设置回填未完成：{error}")),
+        }
+        Ok(())
+    }
+
     fn decode_session(&self, id: &str, state: Option<&str>) -> Result<Session> {
         let is_new = state.is_none();
         let mut session = match state {
@@ -1587,6 +1603,7 @@ fn run(
         Ok(false) => (),
         Err(error) => store.error = Some(format!("历史费用覆盖回填未完成：{error}")),
     }
+    store.restore_effort(&home)?;
     store.hooks_path = Some(hooks.clone());
     let index = home.join("session_index.jsonl");
     store.load_titles(&index)?;
