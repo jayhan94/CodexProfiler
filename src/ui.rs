@@ -1041,7 +1041,13 @@ fn timeline_card(
         }
         response.on_hover_text("点击展开详情");
         open.show_body_unindented(ui, |ui| {
-            ui.add_space(6.0);
+            if matches!(row, TimelineRow::Model(_)) {
+                ui.spacing_mut().item_spacing.y = 3.0;
+                ui.spacing_mut().interact_size.y = 0.0;
+                ui.add_space(2.0);
+            } else {
+                ui.add_space(6.0);
+            }
             meta_line(ui, "轮次", entry.scope.turn_id);
             if entry.scope.archived && row.unfinished() {
                 ui.small("结束未观测；历史记录的耗时未知。");
@@ -1258,40 +1264,8 @@ fn tool_details(ui: &mut egui::Ui, tool: &Tool) {
     }
 }
 
+/// Compact rows use one grid so token counters and request metadata share the same spacing.
 fn request_details(ui: &mut egui::Ui, r: &ModelRequest) {
-    ui.horizontal(|ui| {
-        badge(ui, tier_name(&r.service_tier), theme::PINK_SOFT, theme::INK);
-        badge(
-            ui,
-            &format!("Think {}", effort_name(r)),
-            theme::BLUE,
-            theme::INK,
-        );
-    });
-    for (label, value) in request_token_rows(r) {
-        meta_line(ui, label, &value);
-    }
-    if let Some(id) = &r.compaction_id {
-        meta_line(ui, "所属上下文压缩", id);
-    }
-    ui.label(
-        RichText::new(format!(
-            "API 估算 {}",
-            r.cost_usd.map(money).unwrap_or_else(|| "未知".into())
-        ))
-        .small()
-        .color(theme::MUTED),
-    );
-    meta_line(ui, "请求 ID", &r.id);
-    ui.label(
-        RichText::new(format!(
-            "开始 {}    结束 {}",
-            clock(r.started_ms),
-            clock(r.ended_ms)
-        ))
-        .small()
-        .color(theme::MUTED),
-    );
     let rate = r
         .started_ms
         .zip(r.ended_ms)
@@ -1299,11 +1273,46 @@ fn request_details(ui: &mut egui::Ui, r: &ModelRequest) {
         .filter(|((start, end), _)| end > start)
         .map(|((start, end), n)| format!("{:.1} tok/s", n as f64 * 1000.0 / (end - start) as f64))
         .unwrap_or_else(|| "未知 · 缺少完整请求边界".into());
-    ui.label(
-        RichText::new(format!("有效吞吐量 {rate}  ·  来源 {}", r.source))
-            .small()
-            .color(theme::MUTED),
-    );
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 3.0;
+        ui.spacing_mut().interact_size.y = 0.0;
+        ui.horizontal(|ui| {
+            badge(ui, tier_name(&r.service_tier), theme::PINK_SOFT, theme::INK);
+            badge(
+                ui,
+                &format!("Think {}", effort_name(r)),
+                theme::BLUE,
+                theme::INK,
+            );
+        });
+        egui::Grid::new(("request_details", &r.id))
+            .num_columns(2)
+            .spacing(Vec2::new(12.0, 3.0))
+            .min_row_height(0.0)
+            .show(ui, |ui| {
+                for (label, value) in request_token_rows(r) {
+                    meta_cells(ui, label, &value);
+                    ui.end_row();
+                }
+                if let Some(id) = &r.compaction_id {
+                    meta_cells(ui, "所属上下文压缩", id);
+                    ui.end_row();
+                }
+                for (label, value) in [
+                    (
+                        "API 估算",
+                        r.cost_usd.map(money).unwrap_or_else(|| "未知".into()),
+                    ),
+                    ("请求 ID", r.id.clone()),
+                    ("开始", clock(r.started_ms)),
+                    ("结束", clock(r.ended_ms)),
+                    ("有效吞吐量", format!("{rate} · 来源 {}", r.source)),
+                ] {
+                    meta_cells(ui, label, &value);
+                    ui.end_row();
+                }
+            });
+    });
 }
 
 fn effort_name(request: &ModelRequest) -> &str {
@@ -1619,14 +1628,17 @@ fn dot(ui: &mut egui::Ui, color: Color32) {
 }
 
 fn meta_line(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new(label).size(10.0).color(theme::MUTED));
-        ui.label(
-            RichText::new(if value.is_empty() { "—" } else { value })
-                .size(10.0)
-                .monospace(),
-        );
-    });
+    ui.horizontal_wrapped(|ui| meta_cells(ui, label, value));
+}
+
+/// Label/value typography is shared by wrapped metadata lines and aligned detail grids.
+fn meta_cells(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.label(RichText::new(label).size(10.0).color(theme::MUTED));
+    ui.label(
+        RichText::new(if value.is_empty() { "—" } else { value })
+            .size(10.0)
+            .monospace(),
+    );
 }
 
 // An immutable buffer permits selection and copying while leaving captured commands untouched.
