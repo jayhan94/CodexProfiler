@@ -4,3 +4,5 @@
 *.sqlite*
 /dist/
 /backups/
+__pycache__/
+*.py[cod]
