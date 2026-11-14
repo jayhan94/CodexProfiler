@@ -36,6 +36,7 @@ pub struct Session {
     pub output_tokens: u64,
     pub request_tps: Option<f64>,
     pub tools: Vec<Tool>,
+    pub agent_events: Vec<AgentEvent>,
     pub requests: Vec<ModelRequest>,
     pub cost: CostSummary,
     pub billing_seen: Vec<String>,
@@ -60,6 +61,34 @@ pub struct Tool {
     pub started_ms: i64,
     pub ended_ms: Option<i64>,
     pub status: String,
+}
+
+/// Agent lifecycle notifications are points in time, not measured tool executions.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentEvent {
+    pub id: String,
+    pub kind: String,
+    pub thread_id: String,
+    pub path: String,
+    pub at_ms: i64,
+}
+
+/// Recognize both namespaced desktop calls and standalone collaboration tool names.
+pub fn is_agent_tool(tool: &Tool) -> bool {
+    let name = tool.name.strip_prefix("collaboration");
+    name.is_some()
+        || matches!(
+            tool.name.as_str(),
+            "spawn_agent"
+                | "send_message"
+                | "followup_task"
+                | "list_agents"
+                | "wait_agent"
+                | "interrupt_agent"
+                | "resume_agent"
+                | "close_agent"
+        )
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -211,6 +240,9 @@ pub fn apply(s: &mut Session, row: &Value) {
 }
 
 fn trim_tools(s: &mut Session) {
+    if s.agent_events.len() > 100 {
+        s.agent_events.drain(..s.agent_events.len() - 100);
+    }
     if s.compactions.len() > 50 {
         s.compactions.drain(..s.compactions.len() - 50);
     }
@@ -495,6 +527,7 @@ fn begin(s: &mut Session, id: String, ts: i64) {
     s.seen_responses.clear();
     s.record_tokens = 0;
     s.tools.clear();
+    s.agent_events.clear();
     s.requests.clear();
     s.compactions.clear();
     s.active_compaction = None;
@@ -545,7 +578,11 @@ fn response(s: &mut Session, p: &Value, ts: i64) {
                 s,
                 Tool {
                     id: text(p, "call_id"),
-                    name: text(p, "name"),
+                    name: if p["namespace"] == "collaboration" {
+                        format!("collaboration.{}", text(p, "name"))
+                    } else {
+                        text(p, "name")
+                    },
                     details: call_details(p),
                     compaction_id: compaction_at(s, ts),
                     started_ms: ts,
@@ -591,8 +628,11 @@ fn upsert_tool(s: &mut Session, tool: Tool) {
 
 fn finish_tool(s: &mut Session, id: &str, ts: i64, status: &str) {
     if let Some(t) = s.tools.iter_mut().find(|t| t.id == id) {
-        t.ended_ms = Some(ts);
-        t.status = status.into();
+        // Result delivery can follow a recorded execution end; keep that precise boundary.
+        if t.ended_ms.is_none() {
+            t.ended_ms = Some(ts);
+            t.status = status.into();
+        }
     }
 }
 
@@ -617,6 +657,10 @@ fn command_summary(value: &Value) -> String {
 fn completed_item(s: &mut Session, p: &Value, ts: i64) {
     let i = &p["item"];
     let kind = i["type"].as_str().unwrap_or_default();
+    if kind == "SubAgentActivity" {
+        agent_activity(s, i, ts);
+        return;
+    }
     if kind == "ContextCompaction" {
         compaction_end(s, p, ts, false);
         return;
@@ -637,6 +681,7 @@ fn completed_item(s: &mut Session, p: &Value, ts: i64) {
         "McpToolCall" => format!("{} / {}", text(i, "server"), text(i, "tool")),
         "Extension" => text(i, "kind"),
         "DynamicToolCall" => text(i, "tool"),
+        "CollabAgentToolCall" => format!("collaboration.{}", text(i, "tool")),
         _ => return,
     };
     let start = p["started_at_ms"].as_i64();
@@ -649,12 +694,28 @@ fn completed_item(s: &mut Session, p: &Value, ts: i64) {
                 compaction_id: compaction_at(s, start),
                 details: if kind == "CommandExecution" {
                     detail(&i["command"])
+                } else if kind == "CollabAgentToolCall" {
+                    let targets = detail(&i["receiver_thread_ids"]);
+                    let previous = s
+                        .tools
+                        .iter()
+                        .find(|t| t.id == i["id"])
+                        .map(|t| t.details.as_str())
+                        .unwrap_or_default();
+                    let target_line = format!("子会话：{targets}");
+                    if previous.ends_with(&target_line) {
+                        previous.to_owned()
+                    } else {
+                        format!("{previous}\n{target_line}").trim().to_owned()
+                    }
                 } else {
                     call_details(i)
                 },
                 started_ms: start,
                 ended_ms: Some(p["completed_at_ms"].as_i64().unwrap_or(ts)),
-                status: if i["exit_code"].as_i64().is_some_and(|n| n != 0) {
+                status: if i["status"] == "failed"
+                    || i["exit_code"].as_i64().is_some_and(|n| n != 0)
+                {
                     "失败"
                 } else {
                     "结果已就绪"
@@ -662,6 +723,31 @@ fn completed_item(s: &mut Session, p: &Value, ts: i64) {
                 .into(),
             },
         );
+    }
+}
+
+/// Keep lifecycle notifications separate; the matching call remains the sole tool record.
+fn agent_activity(s: &mut Session, item: &Value, ts: i64) {
+    let id = text(item, "id");
+    if id.is_empty()
+        || !matches!(
+            item["kind"].as_str(),
+            Some("started" | "interacted" | "completed")
+        )
+    {
+        return;
+    }
+    let event = AgentEvent {
+        id: id.clone(),
+        kind: text(item, "kind"),
+        thread_id: text(item, "agent_thread_id"),
+        path: text(item, "agent_path"),
+        at_ms: ts,
+    };
+    if let Some(previous) = s.agent_events.iter_mut().find(|e| e.id == id) {
+        *previous = event;
+    } else {
+        s.agent_events.push(event);
     }
 }
 
@@ -1290,6 +1376,84 @@ fn model_hook(s: &mut Session, p: &Value, ts: i64, name: &str) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // Lifecycle notifications must not duplicate the spawn call or invent child usage/duration.
+    #[test]
+    fn agent_lifecycle_is_separate_from_call_timing_and_cost() {
+        let mut s = Session {
+            turn_id: "turn".into(),
+            ..Session::default()
+        };
+        apply(
+            &mut s,
+            &json!({"type":"response_item","timestamp_ms":100,
+            "payload":{"type":"function_call","namespace":"collaboration",
+                "name":"spawn_agent","call_id":"spawn"}}),
+        );
+        let event = json!({"type":"event_msg","timestamp_ms":200,
+            "payload":{"type":"item_completed","turn_id":"turn",
+                "started_at_ms":200,"completed_at_ms":200,"item":{
+                    "type":"SubAgentActivity","kind":"started","id":"spawn",
+                    "agent_thread_id":"child","agent_path":"/root/test"}}});
+        apply(&mut s, &event);
+        apply(
+            &mut s,
+            &json!({"type":"response_item","timestamp_ms":300,
+            "payload":{"type":"function_call_output","call_id":"spawn"}}),
+        );
+        apply(
+            &mut s,
+            &json!({"type":"event_msg","timestamp_ms":4000,
+            "payload":{"type":"item_completed","turn_id":"turn","item":{
+                "type":"SubAgentActivity","kind":"completed","id":"complete-child",
+                "agent_thread_id":"child","agent_path":"/root/test"}}}),
+        );
+        apply(&mut s, &event);
+        assert_eq!(s.tools.len(), 1);
+        assert!(is_agent_tool(&s.tools[0]));
+        assert_eq!(s.tools[0].started_ms, 100);
+        assert_eq!(s.tools[0].ended_ms, Some(300));
+        assert_eq!(s.agent_events.len(), 2);
+        assert_eq!(s.agent_events[1].at_ms, 4000);
+        assert_eq!(s.output_tokens, 0);
+        assert_eq!(s.cost.total(), 0.0);
+        assert!(s.requests.is_empty());
+    }
+
+    // Recorded collab tool items must provide real wait timing even without response-item logs.
+    #[test]
+    fn collaboration_items_recover_call_and_targets() {
+        let mut s = Session::default();
+        apply(
+            &mut s,
+            &json!({"type":"response_item","timestamp_ms":100,
+            "payload":{"type":"function_call","namespace":"collaboration",
+                "name":"wait","call_id":"wait"}}),
+        );
+        let event = json!({"type":"event_msg","timestamp_ms":450,
+            "payload":{"type":"item_completed","started_at_ms":100,"completed_at_ms":450,
+                "item":{"type":"CollabAgentToolCall","id":"wait", "tool":"wait",
+                    "status":"completed","receiver_thread_ids":["child"]}}});
+        apply(&mut s, &event);
+        let details = s.tools[0].details.clone();
+        apply(&mut s, &event);
+        assert_eq!(s.tools[0].details, details);
+        apply(
+            &mut s,
+            &json!({"type":"response_item","timestamp_ms":471,
+            "payload":{"type":"function_call_output","call_id":"wait"}}),
+        );
+        assert_eq!(s.tools.len(), 1);
+        assert_eq!(s.tools[0].name, "collaboration.wait");
+        assert_eq!(s.tools[0].started_ms, 100);
+        assert_eq!(s.tools[0].ended_ms, Some(450));
+        assert!(s.tools[0].details.contains("child"));
+        assert!(is_agent_tool(&s.tools[0]));
+        assert!(!is_agent_tool(&Tool {
+            name: "wait".into(),
+            ..Tool::default()
+        }));
+    }
 
     // Actual per-turn usage excludes inputs and does not add reasoning twice.
     #[test]

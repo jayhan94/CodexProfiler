@@ -1,5 +1,7 @@
 use crate::collector;
-use crate::model::{now_ms, Compaction, ModelRequest, Session, Snapshot, Tool};
+use crate::model::{
+    is_agent_tool, now_ms, AgentEvent, Compaction, ModelRequest, Session, Snapshot, Tool,
+};
 use crate::{pricing, resources, theme};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use std::collections::{HashMap, HashSet};
@@ -640,6 +642,7 @@ fn metric(ui: &mut egui::Ui, title: &str, value: &str, note: &str, fill: Color32
 #[derive(Clone, Copy)]
 enum TimelineRow<'a> {
     Tool(&'a Tool),
+    Agent(&'a AgentEvent),
     Model(&'a ModelRequest),
     Compaction(&'a Compaction),
 }
@@ -656,6 +659,15 @@ impl TimelineRow<'_> {
                 suffix(r.compaction_id.is_some())
             ),
             Self::Compaction(_) => "上下文压缩".into(),
+            Self::Agent(event) => format!(
+                "{} · {}",
+                agent_event_title(event),
+                if event.path.is_empty() {
+                    &event.thread_id
+                } else {
+                    &event.path
+                }
+            ),
         }
     }
 
@@ -664,11 +676,13 @@ impl TimelineRow<'_> {
         needle.is_empty()
             || self.operation_title().to_lowercase().contains(needle)
             || matches!(self, Self::Tool(t) if t.details.to_lowercase().contains(needle))
+            || matches!(self, Self::Agent(e) if e.thread_id.to_lowercase().contains(needle))
     }
 
     fn time(&self) -> i64 {
         match self {
             Self::Tool(t) => t.started_ms,
+            Self::Agent(e) => e.at_ms,
             Self::Model(r) => r.started_ms.or(r.ended_ms).unwrap_or(0),
             Self::Compaction(c) => c.started_ms.or(c.ended_ms).unwrap_or(0),
         }
@@ -676,9 +690,19 @@ impl TimelineRow<'_> {
     fn key(&self) -> (&str, &str) {
         match self {
             Self::Tool(t) => ("tool", &t.id),
+            Self::Agent(e) => ("agent", &e.id),
             Self::Model(r) => ("model", &r.id),
             Self::Compaction(c) => ("compaction", &c.id),
         }
+    }
+}
+
+fn agent_event_title(event: &AgentEvent) -> &str {
+    match event.kind.as_str() {
+        "started" => "子智能体已启动",
+        "interacted" => "子智能体交互",
+        "completed" => "子智能体已完成",
+        _ => "子智能体事件",
     }
 }
 
@@ -736,6 +760,11 @@ fn render_timeline(ui: &mut egui::Ui, s: &Session, filter: &mut Filter, search: 
             filter_buttons(ui, filter);
         });
     });
+    ui.label(
+        RichText::new("仅展示本轮记录；子智能体事件也可在“工具”中查看。")
+            .small()
+            .color(theme::MUTED),
+    );
     ui.horizontal(|ui| {
         let width = (ui.available_width() - 65.0).max(80.0);
         ui.add_sized(
@@ -770,6 +799,7 @@ fn timeline_rows<'a>(s: &'a Session, filter: Filter, search: &str) -> Vec<Timeli
     let mut rows = Vec::new();
     if matches!(filter, Filter::All | Filter::Tools) {
         rows.extend(s.tools.iter().map(TimelineRow::Tool));
+        rows.extend(s.agent_events.iter().map(TimelineRow::Agent));
     }
     if matches!(filter, Filter::All | Filter::Models) {
         rows.extend(s.requests.iter().map(TimelineRow::Model));
@@ -854,6 +884,7 @@ fn timeline_card(ui: &mut egui::Ui, row: TimelineRow<'_>, session: &Session, col
             ui.add_space(6.0);
             match row {
                 TimelineRow::Tool(t) => tool_details(ui, t),
+                TimelineRow::Agent(e) => agent_details(ui, e),
                 TimelineRow::Model(r) => request_details(ui, r),
                 TimelineRow::Compaction(c) => compaction_details(ui, c, session),
             }
@@ -935,12 +966,16 @@ fn row_summary(
         TimelineRow::Tool(t) => {
             let end = t.ended_ms.or(task_end).unwrap_or_else(now_ms);
             (
-                "TOOL",
+                if is_agent_tool(t) { "AGENT" } else { "TOOL" },
                 row.operation_title(),
                 t.status.clone(),
                 compact_duration(end.saturating_sub(t.started_ms).max(0)),
                 "—".into(),
-                theme::YELLOW_SOFT,
+                if is_agent_tool(t) {
+                    theme::BLUE
+                } else {
+                    theme::YELLOW_SOFT
+                },
             )
         }
         TimelineRow::Model(r) => {
@@ -972,7 +1007,23 @@ fn row_summary(
             "—".into(),
             theme::YELLOW_SOFT,
         ),
+        TimelineRow::Agent(_) => (
+            "AGENT",
+            row.operation_title(),
+            "事件".into(),
+            "—".into(),
+            "—".into(),
+            theme::BLUE,
+        ),
     }
+}
+
+fn agent_details(ui: &mut egui::Ui, event: &AgentEvent) {
+    meta_line(ui, "事件", agent_event_title(event));
+    meta_line(ui, "子会话", &event.thread_id);
+    meta_line(ui, "子智能体", &event.path);
+    meta_line(ui, "时间", &clock(Some(event.at_ms)));
+    ui.small("这是状态通知；模型速率、工具明细和费用请展开左侧子会话查看。");
 }
 
 fn tool_details(ui: &mut egui::Ui, tool: &Tool) {
@@ -1381,6 +1432,13 @@ mod tests {
                 started_ms: Some(40),
                 ..Compaction::default()
             }],
+            agent_events: vec![AgentEvent {
+                id: "agent-notice".into(),
+                kind: "completed".into(),
+                thread_id: "child-123".into(),
+                path: "/root/schema_tests".into(),
+                at_ms: 50,
+            }],
             ..Session::default()
         };
         for (filter, query, expected) in [
@@ -1392,10 +1450,13 @@ mod tests {
             (Filter::Tools, "gpt-6.1", vec![]),
             (Filter::All, "压缩", vec!["compression"]),
             (Filter::All, "missing", vec![]),
+            (Filter::Tools, "schema_tests", vec!["agent-notice"]),
+            (Filter::All, "CHILD-123", vec!["agent-notice"]),
+            (Filter::Models, "schema_tests", vec![]),
             (
                 Filter::All,
                 "  ",
-                vec!["compression", "web", "model", "command"],
+                vec!["agent-notice", "compression", "web", "model", "command"],
             ),
         ] {
             let actual: Vec<_> = timeline_rows(&session, filter, query)
@@ -1404,6 +1465,9 @@ mod tests {
                 .collect();
             assert_eq!(actual, expected, "query: {query}");
         }
+        let event_row = row_summary(TimelineRow::Agent(&session.agent_events[0]), None);
+        assert_eq!(event_row.0, "AGENT");
+        assert_eq!(event_row.3, "—");
     }
 
     // Navigation must leave space for overview and resources at normal and compact heights.

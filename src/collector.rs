@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 const MAX_SESSIONS: usize = 96;
-const CACHE_VERSION: i64 = 7;
+const CACHE_VERSION: i64 = 8;
 const DETAILS_CHARS: usize = 32 * 1024;
 const CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -82,6 +82,7 @@ struct ThinPayload {
     response_id: Option<String>,
     call_id: Option<String>,
     name: Option<String>,
+    namespace: Option<String>,
     tool_use_id: Option<String>,
     tool_name: Option<String>,
     hook_event_name: Option<String>,
@@ -137,6 +138,13 @@ struct ThinItem {
     kind_type: Option<String>,
     id: Option<String>,
     kind: Option<String>,
+    agent_thread_id: Option<String>,
+    agent_path: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    status: Option<String>,
+    sender_thread_id: Option<String>,
+    receiver_thread_ids: Option<Vec<String>>,
     #[serde(deserialize_with = "command_summary")]
     command: Option<String>,
     server: Option<String>,
@@ -309,7 +317,7 @@ impl Store {
         {
             // These tables are a reproducible cache; Codex source logs are never changed.
             db.execute_batch(
-                "BEGIN; DELETE FROM sources; DELETE FROM sessions; PRAGMA user_version=7; COMMIT;",
+                "BEGIN; DELETE FROM sources; DELETE FROM sessions; PRAGMA user_version=8; COMMIT;",
             )?;
         }
         let sessions = {
@@ -1238,5 +1246,68 @@ mod tests {
         assert!(files.contains(&dir.join("rollout-side.jsonl")));
         assert!(!files.contains(&dir.join("rollout-guardian.jsonl")));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Parent timelines retain subagent/collaboration markers without copying agent prompts or outputs.
+    #[test]
+    fn subagent_activity_and_collaboration_keep_only_required_metadata() {
+        let call = serde_json::json!({"type":"response_item","timestamp_ms":1000,
+            "payload":{"type":"function_call","name":"wait","namespace":"collaboration",
+                "call_id":"call-a","arguments":"{}"}});
+        let call = thin_record(&serde_json::to_vec(&call).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(call["payload"]["namespace"], "collaboration");
+        let normalize = |event: &str, item: Value| {
+            let row = serde_json::json!({"type":"event_msg","timestamp_ms":4000,
+                "payload":{"type":event,"thread_id":"parent","turn_id":"turn-a",
+                    "started_at_ms":1000,"completed_at_ms":4000,"item":item}});
+            thin_record(&serde_json::to_vec(&row).unwrap())
+                .unwrap()
+                .unwrap()
+        };
+        for event in ["item_started", "item_completed"] {
+            for kind in ["started", "interacted", "completed"] {
+                let row = normalize(
+                    event,
+                    serde_json::json!({"type":"SubAgentActivity",
+                    "id":"activity-a","kind":kind,"agent_thread_id":"child",
+                    "agent_path":"/root/device_region","model":"gpt-6.1-sol",
+                    "reasoning_effort":"high","prompt":"x".repeat(1024*1024),"output":"discard"}),
+                );
+                let item = &row["payload"]["item"];
+                assert_eq!(row["payload"]["type"], event);
+                assert_eq!(item["id"], "activity-a");
+                assert_eq!(item["kind"], kind);
+                assert_eq!(item["agent_thread_id"], "child");
+                assert_eq!(item["agent_path"], "/root/device_region");
+                assert_eq!(item["model"], "gpt-6.1-sol");
+                assert_eq!(item["reasoning_effort"], "high");
+                assert!(item.get("prompt").is_none());
+                assert!(item.get("output").is_none());
+                assert!(serde_json::to_vec(&row).unwrap().len() < 2048);
+            }
+        }
+        let row = normalize(
+            "item_completed",
+            serde_json::json!({"type":"CollabAgentToolCall",
+            "id":"collab-a","tool":"wait","status":"completed","sender_thread_id":"parent",
+            "receiver_thread_ids":["child-a","child-b"],
+            "receiver_agents":[{"prompt":"x".repeat(1024*1024)}],
+            "agents_states":{"child-a":{"output":"large output"}},"output":"discard"}),
+        );
+        let item = &row["payload"]["item"];
+        assert_eq!(item["id"], "collab-a");
+        assert_eq!(item["tool"], "wait");
+        assert_eq!(item["status"], "completed");
+        assert_eq!(item["sender_thread_id"], "parent");
+        assert_eq!(
+            item["receiver_thread_ids"],
+            serde_json::json!(["child-a", "child-b"])
+        );
+        assert!(item.get("receiver_agents").is_none());
+        assert!(item.get("agents_states").is_none());
+        assert!(item.get("output").is_none());
+        assert!(serde_json::to_vec(&row).unwrap().len() < 2048);
     }
 }
