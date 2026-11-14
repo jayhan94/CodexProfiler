@@ -1,5 +1,6 @@
 use crate::model::{CostMember, CostSummary, Session};
 use std::collections::{HashMap, HashSet};
+use std::iter::once;
 
 /// A read-only view of a chat and its owned agent/side-chat descendants.
 pub struct SessionStats {
@@ -20,6 +21,15 @@ pub fn rollup(root: &Session, sessions: &[Session], costs: &[CostMember]) -> Ses
     let source = if costs.is_empty() { &fallback } else { costs };
     let mut children: HashMap<&str, Vec<&CostMember>> = HashMap::new();
     let mut known: HashSet<&str> = source.iter().map(|member| member.id.as_str()).collect();
+    let unresolved: HashSet<&str> = source
+        .iter()
+        .filter(|member| {
+            member.thread_kind.is_empty()
+                || (matches!(member.thread_kind.as_str(), "subagent" | "side_chat")
+                    && member.parent_id.is_empty())
+        })
+        .map(|member| member.id.as_str())
+        .collect();
     known.insert(&root.id);
     for member in source {
         if matches!(member.thread_kind.as_str(), "subagent" | "side_chat") {
@@ -55,9 +65,16 @@ pub fn rollup(root: &Session, sessions: &[Session], costs: &[CostMember]) -> Ses
             missing.insert(member.id.as_str());
         }
     }
-    for session in sessions.iter().filter(|session| seen.contains(&session.id)) {
+    for session in once(root).chain(
+        sessions
+            .iter()
+            .filter(|session| session.id != root.id && seen.contains(&session.id)),
+    ) {
         for event in &session.agent_events {
-            if !event.thread_id.is_empty() && !known.contains(event.thread_id.as_str()) {
+            if !event.thread_id.is_empty()
+                && (!known.contains(event.thread_id.as_str())
+                    || unresolved.contains(event.thread_id.as_str()))
+            {
                 missing.insert(event.thread_id.as_str());
             }
         }
@@ -277,5 +294,21 @@ mod tests {
         let stats = rollup(&root, &[], &[child]);
         assert_eq!(stats.cost.uncached_usd, 3.0);
         assert!(stats.incomplete_members >= 1);
+    }
+
+    // A hook-only child ID is not proof of resolved ownership; it cannot silently look foreign.
+    #[test]
+    fn known_child_with_unknown_ownership_keeps_parent_partial() {
+        let mut root = session("root", "", "conversation", 1);
+        root.agent_events = vec![event("child")];
+        let child = session("child", "", "", 2);
+        let index = [
+            CostMember::from_session(&root),
+            CostMember::from_session(&child),
+        ];
+        let stats = rollup(&root, &[child], &index);
+        assert_eq!(stats.members.len(), 1);
+        assert_eq!(stats.cost.uncached_usd, 1.0);
+        assert_eq!(stats.missing_children, 1);
     }
 }

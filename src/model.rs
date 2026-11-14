@@ -40,6 +40,8 @@ pub struct Session {
     pub agent_events: Vec<AgentEvent>,
     pub requests: Vec<ModelRequest>,
     pub cost: CostSummary,
+    pub legacy_usage_gaps: Vec<LegacyUsageGap>,
+    pub legacy_canonical_output: Vec<(String, u64)>,
     pub cost_coverage_incomplete: Option<bool>,
     pub cost_coverage: Vec<CostCoverageRequest>,
     pub cost_coverage_known: Vec<CostCoverageUsage>,
@@ -151,6 +153,12 @@ pub struct BillingQuote {
     written: Option<u64>,
     output: Option<u64>,
     price: Option<crate::pricing::CostBreakdown>,
+    #[serde(default = "financial_quote")]
+    financial: bool,
+}
+
+fn financial_quote() -> bool {
+    true
 }
 
 /// Canonical observed request costs across every turn; input includes cache subsets.
@@ -167,6 +175,14 @@ pub struct CostSummary {
     pub output_tokens: u64,
     pub priced_requests: u64,
     pub unpriced_requests: u64,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LegacyUsageGap {
+    pub turn_id: String,
+    pub required_output: u64,
+    pub recovered_output: u64,
 }
 
 /// Small persistent hook evidence, independent of the bounded current-turn timeline.
@@ -227,7 +243,7 @@ impl CostMember {
             title: s.title.clone(),
             agent_name: s.agent_name.clone(),
             cost: Some(s.cost.clone()),
-            partial: s.cost_coverage_incomplete != Some(false),
+            partial: s.cost_coverage_incomplete != Some(false) || has_unpriced_legacy_usage(s),
         }
     }
 }
@@ -241,6 +257,7 @@ pub(crate) fn reset_cost_coverage(s: &mut Session) {
         initialized: true,
         ..CostCoverageRuntime::default()
     };
+    update_coverage_flag(s);
 }
 
 /// Move verified hook observations into the real cached session without touching its prices or metrics.
@@ -249,6 +266,153 @@ pub(crate) fn copy_cost_coverage(target: &mut Session, observed: &Session) {
     target.cost_coverage_known = observed.cost_coverage_known.clone();
     target.cost_coverage_incomplete = observed.cost_coverage_incomplete;
     target.cost_coverage_runtime = CostCoverageRuntime::default();
+    if legacy_usage_incomplete(target) {
+        target.cost_coverage_incomplete = Some(true);
+    }
+}
+
+fn legacy_usage_incomplete(s: &Session) -> bool {
+    s.legacy_usage_gaps
+        .iter()
+        .any(|gap| gap.turn_id.is_empty() || gap.recovered_output < gap.required_output)
+}
+
+fn canonical_output_for_turn(s: &Session, turn: &str) -> u64 {
+    if let Some((_, output)) = s.legacy_canonical_output.iter().find(|(id, _)| id == turn) {
+        return *output;
+    }
+    s.billing_quotes
+        .iter()
+        .filter(|quote| quote.financial && quote.turn_id == turn)
+        .fold(0u64, |total, quote| {
+            total.saturating_add(quote.output.unwrap_or(0))
+        })
+}
+
+fn legacy_unscoped_residual(s: &Session) -> u64 {
+    let current_known = if s.turn_id.is_empty() {
+        0
+    } else {
+        canonical_output_for_turn(s, &s.turn_id)
+    };
+    // Canonical evidence can precede the live UI counters; do not turn its scoped floor into a global gap.
+    let current = if s.turn_id.is_empty() {
+        0
+    } else {
+        let floor = s
+            .legacy_usage_gaps
+            .iter()
+            .find(|gap| gap.turn_id == s.turn_id)
+            .map_or(0, |gap| gap.required_output);
+        s.output_tokens.max(current_known).max(floor)
+    };
+    let other_known = s.cost.output_tokens.saturating_sub(current_known);
+    let scoped_missing = s
+        .legacy_usage_gaps
+        .iter()
+        .filter(|gap| !gap.turn_id.is_empty() && gap.turn_id != s.turn_id)
+        .fold(0u64, |total, gap| {
+            total.saturating_add(gap.required_output.saturating_sub(gap.recovered_output))
+        });
+    s.usage_total
+        .saturating_sub(current)
+        .saturating_sub(other_known)
+        .saturating_sub(scoped_missing)
+}
+
+pub(crate) fn has_unpriced_legacy_usage(s: &Session) -> bool {
+    legacy_usage_incomplete(s)
+        || !s.turn_id.is_empty() && s.output_tokens > canonical_output_for_turn(s, &s.turn_id)
+        || legacy_unscoped_residual(s) > 0
+}
+
+/// Retain cumulative evidence in its recorded turn, independently of the visible live turn.
+fn record_legacy_floor(s: &mut Session, turn: String, required: u64) {
+    let covered = if turn.is_empty() {
+        0
+    } else {
+        canonical_output_for_turn(s, &turn)
+    };
+    if let Some(gap) = s
+        .legacy_usage_gaps
+        .iter_mut()
+        .find(|gap| gap.turn_id == turn)
+    {
+        gap.required_output = gap.required_output.max(required);
+        gap.recovered_output = gap.recovered_output.max(covered);
+    } else if required > covered {
+        s.legacy_usage_gaps.push(LegacyUsageGap {
+            turn_id: turn,
+            required_output: required,
+            recovered_output: covered,
+        });
+    }
+    if legacy_usage_incomplete(s) {
+        s.cost_coverage_incomplete = Some(true);
+    }
+}
+
+/// Preserve both cumulative floors before late-turn filtering; only the usage UI changes live counters.
+fn observe_canonical_floor(s: &mut Session, p: &Value) {
+    if p["thread_id"]
+        .as_str()
+        .is_some_and(|id| !s.id.is_empty() && id != s.id)
+    {
+        return;
+    }
+    if let (Some(turn), Some(required)) = (
+        p["turn_id"].as_str().filter(|id| !id.is_empty()),
+        p["turn_token_usage"]["output_tokens"].as_u64(),
+    ) {
+        record_legacy_floor(s, turn.to_owned(), required);
+    }
+    if let Some(total) = p["thread_token_usage"]["output_tokens"].as_u64() {
+        s.usage_total = s.usage_total.max(total);
+    }
+    mark_unpriced_legacy_usage(s);
+}
+
+/// Legacy output is a cost-coverage floor, not another synthetic priced request.
+pub(crate) fn mark_unpriced_legacy_usage(s: &mut Session) {
+    if !s.turn_id.is_empty() && s.output_tokens > 0 {
+        record_legacy_floor(s, s.turn_id.clone(), s.output_tokens);
+    }
+    let residual = legacy_unscoped_residual(s);
+    if residual > 0 {
+        record_legacy_floor(s, String::new(), residual);
+    }
+}
+
+/// Only a genuinely new charged canonical response credits this turn's missing legacy output.
+fn credit_canonical_output(s: &mut Session, p: &Value) {
+    let turn = text(p, "turn_id");
+    let Some(output) = p["usage"]["output_tokens"].as_u64() else {
+        return;
+    };
+    if turn.is_empty() {
+        return;
+    }
+    let previous = canonical_output_for_turn(s, &turn);
+    // Older caches put cumulative floors in this counter; rebuild its sum before usage adds this response.
+    if turn == s.turn_id {
+        s.record_tokens = previous;
+    }
+    let current = previous.saturating_add(output);
+    if let Some(entry) = s
+        .legacy_canonical_output
+        .iter_mut()
+        .find(|(id, _)| id == &turn)
+    {
+        entry.1 = current;
+    } else {
+        s.legacy_canonical_output.push((turn.clone(), current));
+    }
+    for gap in &mut s.legacy_usage_gaps {
+        if gap.turn_id == turn {
+            gap.recovered_output = gap.recovered_output.max(current);
+        }
+    }
+    update_coverage_flag(s);
 }
 
 fn index_cost_coverage(s: &mut Session) {
@@ -301,8 +465,10 @@ fn index_cost_coverage(s: &mut Session) {
 }
 
 fn update_coverage_flag(s: &mut Session) {
+    index_cost_coverage(s);
     if s.cost_coverage_incomplete.is_some() {
-        s.cost_coverage_incomplete = Some(s.cost_coverage_runtime.pending > 0);
+        s.cost_coverage_incomplete =
+            Some(s.cost_coverage_runtime.pending > 0 || legacy_usage_incomplete(s));
     }
 }
 
@@ -678,6 +844,10 @@ fn timestamp(row: &Value) -> i64 {
 
 // Log observations never imply that the server received input or is reasoning.
 pub fn apply(s: &mut Session, row: &Value) {
+    apply_with_billing(s, row, true);
+}
+
+pub fn apply_with_billing(s: &mut Session, row: &Value, allow_charge: bool) {
     let p = &row["payload"];
     let ts = timestamp(row);
     // A hook may arrive before the transcript's first metadata record.
@@ -696,8 +866,14 @@ pub fn apply(s: &mut Session, row: &Value) {
     // Billing follows canonical response ownership, independently of the displayed latest turn.
     remember_billing_model(s, row);
     observe_service_tier(s, row, ts);
-    if row["type"] == "token_usage_record" && account_usage(s, p, ts) {
-        refresh_coverage_scope(s, Some(p["turn_id"].as_str().unwrap_or_default()));
+    let mut new_usage = false;
+    if row["type"] == "token_usage_record" {
+        let changed = account_usage(s, p, ts, allow_charge);
+        new_usage = allow_charge && changed;
+        observe_canonical_floor(s, p);
+        if changed {
+            refresh_coverage_scope(s, Some(p["turn_id"].as_str().unwrap_or_default()));
+        }
     }
     if ts > 0 && ts < s.last_ms {
         // Multiple sources can deliver boundaries late; retain timing without rewinding status.
@@ -712,7 +888,7 @@ pub fn apply(s: &mut Session, row: &Value) {
         } else if row["type"] == "event_msg" && p["type"] == "token_count" {
             event(s, p, ts);
         } else if same_turn && row["type"] == "token_usage_record" {
-            usage(s, p, ts);
+            usage(s, p, ts, new_usage);
         } else if row["type"] == "compacted" && s.started_ms.is_some_and(|start| ts >= start) {
             compaction_end(s, p, ts, false);
         }
@@ -730,7 +906,7 @@ pub fn apply(s: &mut Session, row: &Value) {
         }
         "event_msg" => event(s, p, ts),
         "response_item" => response(s, p, ts),
-        "token_usage_record" => usage(s, p, ts),
+        "token_usage_record" => usage(s, p, ts, new_usage),
         "hook_event" | "monitor_hook" => hook(s, p, ts),
         "compacted" => compaction_end(s, p, ts, false),
         _ => {}
@@ -838,6 +1014,9 @@ fn reconcile_service_history(s: &mut Session) {
     // The ledger outlives the visible request buffer, so older observed starts remain correctable.
     for index in 0..s.billing_quotes.len() {
         let mut quote = s.billing_quotes[index].clone();
+        if !quote.financial {
+            continue;
+        }
         if matches!(quote.tier_source.as_str(), "request" | "response") {
             continue;
         }
@@ -1014,6 +1193,8 @@ fn begin(s: &mut Session, id: String, ts: i64) {
     if id == s.turn_id && s.started_ms.is_some() {
         return;
     }
+    // Current-turn counters are transient; preserve any proven missing usage before resetting them.
+    mark_unpriced_legacy_usage(s);
     s.turn_id = id;
     s.started_ms = Some(ts);
     s.ended_ms = None;
@@ -1063,6 +1244,9 @@ fn event(s: &mut Session, p: &Value, ts: i64) {
                 if s.started_ms.is_some_and(|start| ts >= start) {
                     s.output_tokens = s.output_tokens.max(total.saturating_sub(s.turn_base));
                 }
+            }
+            if has_unpriced_legacy_usage(s) {
+                mark_unpriced_legacy_usage(s);
             }
         }
         "item_completed" => completed_item(s, p, ts),
@@ -1283,7 +1467,7 @@ fn usage_model<'a>(s: &'a Session, p: &'a Value) -> &'a str {
 }
 
 /// Source cursors guarantee replay continuity; this recent-ID guard also rejects duplicate records.
-fn account_usage(s: &mut Session, p: &Value, ts: i64) -> bool {
+fn account_usage(s: &mut Session, p: &Value, ts: i64, allow_charge: bool) -> bool {
     if p["thread_id"]
         .as_str()
         .is_some_and(|owner| !s.id.is_empty() && owner != s.id)
@@ -1293,6 +1477,9 @@ fn account_usage(s: &mut Session, p: &Value, ts: i64) -> bool {
     let Some(id) = p["response_id"].as_str().filter(|id| !id.is_empty()) else {
         return false;
     };
+    if !allow_charge {
+        return seen_usage_evidence(s, p, ts);
+    }
     if s.billing_seen.iter().any(|seen| seen == id) {
         return false;
     }
@@ -1300,6 +1487,7 @@ fn account_usage(s: &mut Session, p: &Value, ts: i64) -> bool {
     if s.billing_seen.len() > 2048 {
         s.billing_seen.remove(0);
     }
+    credit_canonical_output(s, p);
     let usage = &p["usage"];
     let input = usage["input_tokens"].as_u64();
     let output = usage["output_tokens"].as_u64();
@@ -1329,6 +1517,7 @@ fn account_usage(s: &mut Session, p: &Value, ts: i64) -> bool {
         written,
         output,
         price: None,
+        financial: true,
     };
     let priced = quote_price(&quote);
     quote.price = priced;
@@ -1344,6 +1533,35 @@ fn account_usage(s: &mut Session, p: &Value, ts: i64) -> bool {
         s.cost.priced_requests += 1;
     } else {
         s.cost.unpriced_requests += 1;
+    }
+    true
+}
+
+/// Historical replay still contributes identity/coverage, but has no permission to alter old money.
+fn seen_usage_evidence(s: &mut Session, p: &Value, ts: i64) -> bool {
+    let id = text(p, "response_id");
+    if s.billing_quotes.iter().any(|quote| quote.response_id == id) {
+        return false;
+    }
+    let usage = &p["usage"];
+    let (tier, tier_source) = usage_tier(s, p, ts);
+    s.billing_quotes.push(BillingQuote {
+        response_id: id,
+        turn_id: text(p, "turn_id"),
+        timestamp_ms: ts,
+        request_started_ms: usage_start(s, p, ts),
+        model: usage_model(s, p).into(),
+        tier,
+        tier_source,
+        input: usage["input_tokens"].as_u64(),
+        cached: usage["cached_input_tokens"].as_u64(),
+        written: usage["cache_write_input_tokens"].as_u64(),
+        output: usage["output_tokens"].as_u64(),
+        price: None,
+        financial: false,
+    });
+    if s.billing_quotes.len() > 2048 {
+        s.billing_quotes.remove(0);
     }
     true
 }
@@ -1392,7 +1610,8 @@ fn reconcile_request_bill(s: &mut Session, index: usize) {
     r.cache_write_input_tokens = quote.written.or(r.cache_write_input_tokens);
     r.output_tokens = quote.output.or(r.output_tokens);
     fill_request_cost(r, &Value::Null);
-    if r.service_tier_source == "assumed"
+    if !quote.financial
+        || r.service_tier_source == "assumed"
         || matches!(quote.tier_source.as_str(), "request" | "response")
     {
         s.billing_quotes[billing] = quote;
@@ -1470,33 +1689,27 @@ fn fill_request_cost(request: &mut ModelRequest, usage: &Value) {
 }
 
 // Cumulative per-turn usage is authoritative; response IDs deduplicate older formats.
-fn usage(s: &mut Session, p: &Value, ts: i64) {
+fn usage(s: &mut Session, p: &Value, ts: i64, allow_reprice: bool) {
     if p["turn_id"].as_str().is_some_and(|id| id != s.turn_id) {
         return;
     }
-    request_usage(s, p, ts);
-    if let Some(total) = p["thread_token_usage"]["output_tokens"].as_u64() {
-        s.usage_total = s.usage_total.max(total);
+    request_usage(s, p, ts, allow_reprice);
+    // Keep response sums separate from cumulative floors so late older responses do not add a floor twice.
+    if let Some(id) = p["response_id"].as_str().filter(|_| allow_reprice) {
+        if !s.seen_responses.iter().any(|seen| seen == id) {
+            if let Some(tokens) = p["usage"]["output_tokens"].as_u64() {
+                remember_response(s, p);
+                s.record_tokens = s.record_tokens.saturating_add(tokens);
+                s.records = true;
+            }
+        }
     }
     if let Some(total) = p["turn_token_usage"]["output_tokens"].as_u64() {
         s.output_tokens = s.output_tokens.max(total);
-        s.record_tokens = s.record_tokens.max(total);
-        remember_response(s, p);
-        s.records = true;
-        return;
-    }
-    let Some(id) = p["response_id"].as_str() else {
-        return;
-    };
-    if s.seen_responses.iter().any(|seen| seen == id) {
-        return;
-    }
-    if let Some(tokens) = p["usage"]["output_tokens"].as_u64() {
-        remember_response(s, p);
-        s.record_tokens = s.record_tokens.saturating_add(tokens);
-        s.output_tokens = s.output_tokens.max(s.record_tokens);
         s.records = true;
     }
+    s.output_tokens = s.output_tokens.max(s.record_tokens);
+    mark_unpriced_legacy_usage(s);
 }
 
 fn remember_response(s: &mut Session, p: &Value) {
@@ -1702,14 +1915,16 @@ fn call_details(p: &Value) -> String {
 }
 
 // Usage-only history is visible but has no invented request start or throughput.
-fn request_usage(s: &mut Session, p: &Value, ts: i64) {
+fn request_usage(s: &mut Session, p: &Value, ts: i64, allow_reprice: bool) {
     let Some(id) = p["response_id"].as_str().filter(|id| !id.is_empty()) else {
         return;
     };
     let tokens = p["usage"]["output_tokens"].as_u64();
     if let Some(index) = s.requests.iter().position(|r| r.id == id) {
         fill_request_cost(&mut s.requests[index], &p["usage"]);
-        reconcile_request_bill(s, index);
+        if allow_reprice {
+            reconcile_request_bill(s, index);
+        }
         refresh_latest_tps(s, index);
         return;
     }
@@ -1729,7 +1944,9 @@ fn request_usage(s: &mut Session, p: &Value, ts: i64) {
         r.id = id.into();
         r.source = "hook+usage".into();
         fill_request_cost(r, &p["usage"]);
-        reconcile_request_bill(s, matches[0]);
+        if allow_reprice {
+            reconcile_request_bill(s, matches[0]);
+        }
         refresh_latest_tps(s, matches[0]);
     } else {
         let (tier, tier_source) = usage_tier(s, p, ts);
@@ -1912,6 +2129,70 @@ fn model_hook(s: &mut Session, p: &Value, ts: i64, name: &str) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // Old receipts can restore request details after UI eviction without adding output or false gaps.
+    #[test]
+    fn seen_replay_after_ui_eviction_keeps_output_and_coverage_stable() {
+        for allow_charge in [false, true] {
+            let mut s = coverage_session();
+            for index in 0..130 {
+                apply(
+                    &mut s,
+                    &priced_record(&format!("r{index}"), "one", 1000 + index, 10, 0, 0, 1),
+                );
+            }
+            assert_eq!(s.output_tokens, 130);
+            assert!(!CostMember::from_session(&s).partial);
+            let mut restored: Session =
+                serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+            apply_with_billing(
+                &mut restored,
+                &priced_record("r0", "one", 1000, 10, 0, 0, 1),
+                allow_charge,
+            );
+            assert_eq!(restored.cost.output_tokens, 130);
+            assert_eq!(restored.output_tokens, 130);
+            assert!(!CostMember::from_session(&restored).partial);
+            assert!(restored.requests.iter().any(|request| request.id == "r0"));
+        }
+    }
+
+    // A cumulative turn floor is durable evidence even when a thread-wide total is absent.
+    #[test]
+    fn authoritative_turn_floor_gap_survives_turn_reset_and_late_recovery() {
+        let mut s = coverage_session();
+        let mut row = priced_record("part", "one", 2000, 1000, 0, 0, 100);
+        row["payload"]["turn_token_usage"] = json!({"output_tokens":150});
+        apply(&mut s, &row);
+        assert!(CostMember::from_session(&s).partial);
+        billing_turn(&mut s, "two", "gpt-6.1-sol", 3000);
+        let mut restarted: Session =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(CostMember::from_session(&restarted).partial);
+        apply(
+            &mut restarted,
+            &priced_record("missing", "one", 1500, 1000, 0, 0, 50),
+        );
+        assert!(!CostMember::from_session(&restarted).partial);
+        assert_eq!(restarted.turn_id, "two");
+    }
+
+    // New-turn usage after deserialization cannot clear an unrelated old unmatched completion.
+    #[test]
+    fn canonical_first_after_restart_preserves_old_unmatched_coverage() {
+        let mut s = coverage_session();
+        request_event(&mut s, 1000, "PreModelRequest");
+        request_event(&mut s, 2000, "PostModelRequest");
+        billing_turn(&mut s, "two", "gpt-6.1-sol", 3000);
+        let mut restarted: Session =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        apply(
+            &mut restarted,
+            &priced_record("new", "two", 4000, 100, 0, 0, 10),
+        );
+        assert_eq!(restarted.cost_coverage_incomplete, Some(true));
+        assert!(CostMember::from_session(&restarted).partial);
+    }
 
     // Lifecycle notifications must not duplicate the spawn call or invent child usage/duration.
     #[test]
@@ -3154,5 +3435,276 @@ mod tests {
         apply(&mut s, &usage);
         assert_eq!(s.cost_coverage_incomplete, Some(true));
         assert_eq!(s.cost.priced_requests, 0);
+    }
+
+    // A durable Seen receipt still supplies timeline evidence but never adds money or later re-prices it.
+    #[test]
+    fn durable_seen_usage_cannot_charge_or_reprice_again() {
+        let mut s = coverage_session();
+        apply(&mut s, &priced_record("paid", "one", 900, 1000, 0, 0, 100));
+        let before = serde_json::to_value(&s.cost).unwrap();
+        s.billing_seen.clear();
+        s.billing_quotes.clear();
+        request_event(&mut s, 1000, "PreModelRequest");
+        apply_with_billing(
+            &mut s,
+            &priced_record("paid", "one", 1100, 1000, 0, 0, 100),
+            false,
+        );
+        request_event(&mut s, 1200, "PostModelRequest");
+        service_setting(&mut s, 950, json!("priority"));
+        assert_eq!(serde_json::to_value(&s.cost).unwrap(), before);
+        assert_eq!(s.billing_quotes.len(), 1);
+        assert!(!s.billing_quotes[0].financial);
+        assert_eq!(s.requests[0].output_tokens, Some(100));
+    }
+
+    // Legacy current-turn output remains partial across resets/copy until that turn gains unique canonical usage.
+    #[test]
+    fn legacy_gap_is_recovered_by_same_turn_canonical_only() {
+        let mut s = coverage_session();
+        apply(
+            &mut s,
+            &json!({"type":"event_msg","timestamp_ms":1000,
+            "payload":{"type":"token_count","info":{"total_token_usage":{"output_tokens":100}}}}),
+        );
+        assert!(has_unpriced_legacy_usage(&s));
+        assert_eq!(s.cost_coverage_incomplete, Some(true));
+        reset_cost_coverage(&mut s);
+        refresh_cost_coverage(&mut s);
+        assert_eq!(s.cost_coverage_incomplete, Some(true));
+        let mut observed = Session::default();
+        reset_cost_coverage(&mut observed);
+        copy_cost_coverage(&mut s, &observed);
+        refresh_cost_coverage(&mut s);
+        assert_eq!(s.cost_coverage_incomplete, Some(true));
+        billing_turn(&mut s, "two", "gpt-6.1-sol", 2000);
+        apply(
+            &mut s,
+            &priced_record("other", "two", 2100, 1000, 0, 0, 100),
+        );
+        assert_eq!(s.cost_coverage_incomplete, Some(true));
+        apply(&mut s, &priced_record("old", "one", 1100, 1000, 0, 0, 100));
+        assert_eq!(s.cost_coverage_incomplete, Some(false));
+    }
+
+    // Repeated observations increase only the floor; duplicate or Seen canonical rows supply no extra credit.
+    #[test]
+    fn legacy_gap_does_not_double_credit_replayed_responses() {
+        let mut s = coverage_session();
+        s.output_tokens = 200;
+        mark_unpriced_legacy_usage(&mut s);
+        mark_unpriced_legacy_usage(&mut s);
+        let usage = priced_record("one", "one", 1000, 1000, 0, 0, 100);
+        apply(&mut s, &usage);
+        apply_with_billing(&mut s, &usage, false);
+        apply(&mut s, &usage);
+        assert_eq!(s.legacy_usage_gaps.len(), 1);
+        assert_eq!(s.legacy_usage_gaps[0].recovered_output, 100);
+        assert_eq!(s.cost_coverage_incomplete, Some(true));
+        apply(&mut s, &priced_record("two", "one", 1100, 1000, 0, 0, 100));
+        assert_eq!(s.cost_coverage_incomplete, Some(false));
+    }
+
+    // Late old-turn cumulative evidence survives restart and clears only with that turn's missing usage.
+    #[test]
+    fn late_prior_turn_floor_preserves_gap_without_rewinding_live_counters() {
+        let mut s = coverage_session();
+        billing_turn(&mut s, "two", "gpt-6-luna", 2000);
+        let mut late = priced_record("old-second", "one", 1100, 1000, 0, 0, 100);
+        late["payload"]["turn_token_usage"] = json!({"output_tokens":150});
+        apply(&mut s, &late);
+        assert_eq!(s.turn_id, "two");
+        assert_eq!(s.model, "gpt-6-luna");
+        assert_eq!(s.output_tokens, 0);
+        assert_eq!(s.cost.output_tokens, 100);
+        assert_eq!(s.cost_coverage_incomplete, Some(true));
+        assert_eq!(s.legacy_usage_gaps.len(), 1);
+        assert_eq!(s.legacy_usage_gaps[0].turn_id, "one");
+        assert_eq!(s.legacy_usage_gaps[0].required_output, 150);
+        assert_eq!(s.legacy_usage_gaps[0].recovered_output, 100);
+        let mut restored: Session =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(CostMember::from_session(&restored).partial);
+        apply(
+            &mut restored,
+            &priced_record("old-first", "one", 1050, 1000, 0, 0, 50),
+        );
+        assert_eq!(restored.cost_coverage_incomplete, Some(false));
+        assert_eq!(restored.cost.output_tokens, 150);
+        assert_eq!(restored.turn_id, "two");
+        assert_eq!(restored.output_tokens, 0);
+        assert!(!CostMember::from_session(&restored).partial);
+    }
+
+    // A late old turn's thread total preserves its unscoped remainder across restart without changing live output.
+    #[test]
+    fn late_thread_floor_preserves_unscoped_remainder() {
+        let mut s = coverage_session();
+        billing_turn(&mut s, "two", "gpt-6-luna", 2000);
+        let mut late = priced_record("old", "one", 1100, 1000, 0, 0, 100);
+        late["payload"]["turn_token_usage"] = json!({"output_tokens":100});
+        late["payload"]["thread_token_usage"] = json!({"output_tokens":500});
+        apply(&mut s, &late);
+        assert_eq!(s.usage_total, 500);
+        assert_eq!(s.output_tokens, 0);
+        assert_eq!(s.turn_id, "two");
+        assert_eq!(s.cost.output_tokens, 100);
+        assert_eq!(s.legacy_usage_gaps.len(), 1);
+        assert_eq!(s.legacy_usage_gaps[0].turn_id, "");
+        assert_eq!(s.legacy_usage_gaps[0].required_output, 400);
+        let restored: Session = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(CostMember::from_session(&restored).partial);
+    }
+
+    // Current and late-turn scoped floors must not also create an anonymous gap that prevents recovery.
+    #[test]
+    fn canonical_thread_floor_does_not_duplicate_scoped_evidence() {
+        for late in [false, true] {
+            let mut s = coverage_session();
+            if late {
+                billing_turn(&mut s, "two", "gpt-6-luna", 2000);
+            }
+            let mut row = priced_record("second", "one", 1100, 1000, 0, 0, 100);
+            row["payload"]["turn_token_usage"] = json!({"output_tokens":150});
+            row["payload"]["thread_token_usage"] = json!({"output_tokens":150});
+            apply(&mut s, &row);
+            assert_eq!(s.legacy_usage_gaps.len(), 1);
+            assert_eq!(s.legacy_usage_gaps[0].turn_id, "one");
+            assert!(CostMember::from_session(&s).partial);
+            if !late {
+                // Pre-fix caches stored the aggregate floor here; late recovery must not add it twice.
+                s.record_tokens = 150;
+                s = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+            }
+            apply(&mut s, &priced_record("first", "one", 1050, 1000, 0, 0, 50));
+            assert!(!CostMember::from_session(&s).partial);
+            assert_eq!(s.output_tokens, if late { 0 } else { 150 });
+        }
+    }
+
+    // Complete current-turn counters and a thread-only total keep their distinct completeness semantics.
+    #[test]
+    fn canonical_floor_handles_complete_and_turnless_totals() {
+        let mut complete = coverage_session();
+        let mut row = priced_record("paid", "one", 1100, 1000, 0, 0, 100);
+        row["payload"]["turn_token_usage"] = json!({"output_tokens":100});
+        row["payload"]["thread_token_usage"] = json!({"output_tokens":100});
+        apply(&mut complete, &row);
+        assert!(complete.legacy_usage_gaps.is_empty());
+        assert!(!CostMember::from_session(&complete).partial);
+        let mut turnless = Session {
+            id: "chat".into(),
+            ..Session::default()
+        };
+        reset_cost_coverage(&mut turnless);
+        row["payload"]["turn_id"] = Value::Null;
+        row["payload"]["turn_token_usage"] = Value::Null;
+        row["payload"]["thread_token_usage"] = json!({"output_tokens":500});
+        apply(&mut turnless, &row);
+        assert_eq!(turnless.usage_total, 500);
+        assert_eq!(turnless.legacy_usage_gaps[0].turn_id, "");
+        assert_eq!(turnless.legacy_usage_gaps[0].required_output, 400);
+        assert!(CostMember::from_session(&turnless).partial);
+    }
+
+    // A global legacy count with no reliable turn attribution cannot be cleared by an unrelated new turn.
+    #[test]
+    fn global_legacy_evidence_stays_partial_without_scope() {
+        let mut s = Session {
+            id: "chat".into(),
+            usage_total: 100,
+            ..Session::default()
+        };
+        assert!(has_unpriced_legacy_usage(&s));
+        mark_unpriced_legacy_usage(&mut s);
+        reset_cost_coverage(&mut s);
+        billing_turn(&mut s, "one", "gpt-6.1-sol", 1000);
+        apply(&mut s, &priced_record("new", "one", 1100, 1000, 0, 0, 100));
+        refresh_cost_coverage(&mut s);
+        assert_eq!(s.cost_coverage_incomplete, Some(true));
+    }
+
+    // Current-turn legacy output is missing even if prior turns already have known financial records.
+    #[test]
+    fn priced_prior_turn_does_not_hide_new_legacy_gap() {
+        let mut s = coverage_session();
+        apply(
+            &mut s,
+            &priced_record("prior", "one", 1000, 1000, 0, 0, 100),
+        );
+        billing_turn(&mut s, "two", "gpt-6.1-sol", 2000);
+        s.output_tokens = 50;
+        assert!(has_unpriced_legacy_usage(&s));
+        mark_unpriced_legacy_usage(&mut s);
+        assert_eq!(s.cost_coverage_incomplete, Some(true));
+        assert_eq!(s.legacy_usage_gaps[0].turn_id, "two");
+    }
+
+    // Even a still-resident financial quote cannot be re-priced as a side effect of a Seen replay row.
+    #[test]
+    fn seen_row_does_not_reconcile_an_existing_financial_quote() {
+        let mut s = coverage_session();
+        request_event(&mut s, 900, "PreModelRequest");
+        let row = priced_record("paid", "one", 1000, 1000, 0, 0, 100);
+        apply(&mut s, &row);
+        request_event(&mut s, 1100, "PostModelRequest");
+        let before = serde_json::to_value(&s.cost).unwrap();
+        s.requests[0].service_tier = "priority".into();
+        s.requests[0].service_tier_source = "request".into();
+        apply_with_billing(&mut s, &row, false);
+        assert_eq!(serde_json::to_value(&s.cost).unwrap(), before);
+        assert!(s.billing_quotes[0].financial);
+    }
+
+    // Recovering the scoped 99 tokens cannot hide an unscoped 21-token historical remainder.
+    #[test]
+    fn cumulative_legacy_remainder_stays_unknown_after_current_turn_recovers() {
+        let mut s = coverage_session();
+        s.usage_total = 120;
+        s.output_tokens = 99;
+        mark_unpriced_legacy_usage(&mut s);
+        assert_eq!(
+            s.legacy_usage_gaps
+                .iter()
+                .find(|g| g.turn_id.is_empty())
+                .unwrap()
+                .required_output,
+            21
+        );
+        apply(
+            &mut s,
+            &priced_record("current", "one", 1000, 1000, 0, 0, 99),
+        );
+        refresh_cost_coverage(&mut s);
+        assert_eq!(s.cost_coverage_incomplete, Some(true));
+        assert_eq!(
+            s.legacy_usage_gaps
+                .iter()
+                .find(|g| g.turn_id == "one")
+                .unwrap()
+                .recovered_output,
+            99
+        );
+    }
+
+    // Turning an already scoped gap into an anonymous gap would make legitimate late recovery impossible.
+    #[test]
+    fn new_turn_does_not_duplicate_old_scoped_gap_as_global() {
+        let mut s = coverage_session();
+        s.output_tokens = 100;
+        s.usage_total = 100;
+        mark_unpriced_legacy_usage(&mut s);
+        billing_turn(&mut s, "two", "gpt-6.1-sol", 2000);
+        s.output_tokens = 50;
+        s.usage_total = 150;
+        mark_unpriced_legacy_usage(&mut s);
+        assert!(s.legacy_usage_gaps.iter().all(|g| !g.turn_id.is_empty()));
+        apply(
+            &mut s,
+            &priced_record("older", "one", 1000, 1000, 0, 0, 100),
+        );
+        apply(&mut s, &priced_record("newer", "two", 2100, 1000, 0, 0, 50));
+        assert_eq!(s.cost_coverage_incomplete, Some(false));
     }
 }

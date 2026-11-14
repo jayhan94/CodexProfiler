@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod billing;
 mod collector;
 mod coverage_migration;
 mod hook;
@@ -7,6 +8,7 @@ mod model;
 mod pricing;
 mod resources;
 mod setup;
+mod source_state;
 mod stats;
 mod theme;
 mod ui;
