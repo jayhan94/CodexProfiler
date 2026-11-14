@@ -224,6 +224,7 @@ pub struct Monitor {
     ordered_ids: Vec<String>,
     show_internal: bool,
     filter: Filter,
+    timeline_search: String,
     page: Page,
     resources: resources::Monitor,
 }
@@ -241,6 +242,7 @@ impl Monitor {
             ordered_ids: Vec::new(),
             show_internal: false,
             filter: Filter::default(),
+            timeline_search: String::new(),
             page: Page::default(),
             resources: resources::Monitor::new(context.egui_ctx.clone()),
         }
@@ -360,7 +362,9 @@ impl eframe::App for Monitor {
                     egui::ScrollArea::vertical()
                         .id_salt(("session_content", &s.id))
                         .auto_shrink([false, false])
-                        .show(ui, |ui| render_session(ui, s, &mut self.filter));
+                        .show(ui, |ui| {
+                            render_session(ui, s, &mut self.filter, &mut self.timeline_search)
+                        });
                     let minimized = ctx.input(|i| i.viewport().minimized == Some(true));
                     if is_active(s, now_ms()) && !minimized {
                         ctx.request_repaint_after(Duration::from_secs(1));
@@ -523,7 +527,7 @@ fn empty_state(ui: &mut egui::Ui) {
     });
 }
 
-fn render_session(ui: &mut egui::Ui, s: &Session, filter: &mut Filter) {
+fn render_session(ui: &mut egui::Ui, s: &Session, filter: &mut Filter, search: &mut String) {
     ui.label(
         RichText::new("SESSION OVERVIEW")
             .size(10.0)
@@ -550,7 +554,7 @@ fn render_session(ui: &mut egui::Ui, s: &Session, filter: &mut Filter) {
     metrics(ui, s);
     cost_details(ui, s);
     ui.add_space(20.0);
-    render_timeline(ui, s, filter);
+    render_timeline(ui, s, filter, search);
 }
 
 fn task_elapsed(s: &Session) -> Option<i64> {
@@ -641,6 +645,27 @@ enum TimelineRow<'a> {
 }
 
 impl TimelineRow<'_> {
+    fn operation_title(self) -> String {
+        let suffix = |compaction: bool| if compaction { " · 压缩" } else { "" };
+        match self {
+            Self::Tool(t) => format!("{}{}", t.name, suffix(t.compaction_id.is_some())),
+            Self::Model(r) => format!(
+                "{} · {}{}",
+                r.model,
+                tier_name(&r.service_tier),
+                suffix(r.compaction_id.is_some())
+            ),
+            Self::Compaction(_) => "上下文压缩".into(),
+        }
+    }
+
+    /// Search the complete operation and command, including text clipped in the table.
+    fn matches_search(self, needle: &str) -> bool {
+        needle.is_empty()
+            || self.operation_title().to_lowercase().contains(needle)
+            || matches!(self, Self::Tool(t) if t.details.to_lowercase().contains(needle))
+    }
+
     fn time(&self) -> i64 {
         match self {
             Self::Tool(t) => t.started_ms,
@@ -704,35 +729,58 @@ fn timeline_frame() -> egui::Frame {
 }
 
 /// The timeline keeps column geometry identical for models and tools, regardless of title length.
-fn render_timeline(ui: &mut egui::Ui, s: &Session, filter: &mut Filter) {
+fn render_timeline(ui: &mut egui::Ui, s: &Session, filter: &mut Filter, search: &mut String) {
     ui.horizontal(|ui| {
         ui.label(RichText::new("运行时间线").size(15.0).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             filter_buttons(ui, filter);
         });
     });
+    ui.horizontal(|ui| {
+        let width = (ui.available_width() - 65.0).max(80.0);
+        ui.add_sized(
+            [width, 28.0],
+            egui::TextEdit::singleline(search)
+                .id_salt("timeline_operation_search")
+                .hint_text("搜索操作：工具、命令、模型…"),
+        );
+        if ui
+            .add_enabled(!search.is_empty(), egui::Button::new("清除"))
+            .clicked()
+        {
+            search.clear();
+        }
+    });
     ui.add_space(7.0);
     let columns = timeline_heading(ui);
     ui.add_space(5.0);
-    let mut rows = Vec::new();
-    if matches!(*filter, Filter::All | Filter::Tools) {
-        rows.extend(s.tools.iter().map(TimelineRow::Tool));
-    }
-    if matches!(*filter, Filter::All | Filter::Models) {
-        rows.extend(s.requests.iter().map(TimelineRow::Model));
-    }
-    if matches!(*filter, Filter::All | Filter::Compactions) {
-        rows.extend(s.compactions.iter().map(TimelineRow::Compaction));
-    }
-    rows.sort_by(|a, b| b.time().cmp(&a.time()).then(a.key().cmp(&b.key())));
+    let rows = timeline_rows(s, *filter, search);
     if rows.is_empty() {
         ui.add_space(30.0);
-        ui.label(RichText::new("当前筛选暂无记录").color(theme::MUTED));
+        ui.label(RichText::new("当前筛选暂无匹配的操作").color(theme::MUTED));
     }
     for row in rows.into_iter().take(300) {
         ui.push_id((&s.id, row.key()), |ui| timeline_card(ui, row, s, columns));
         ui.add_space(5.0);
     }
+}
+
+/// Apply type and keyword filters together before limiting the visible history.
+fn timeline_rows<'a>(s: &'a Session, filter: Filter, search: &str) -> Vec<TimelineRow<'a>> {
+    let mut rows = Vec::new();
+    if matches!(filter, Filter::All | Filter::Tools) {
+        rows.extend(s.tools.iter().map(TimelineRow::Tool));
+    }
+    if matches!(filter, Filter::All | Filter::Models) {
+        rows.extend(s.requests.iter().map(TimelineRow::Model));
+    }
+    if matches!(filter, Filter::All | Filter::Compactions) {
+        rows.extend(s.compactions.iter().map(TimelineRow::Compaction));
+    }
+    let needle = search.trim().to_lowercase();
+    rows.retain(|row| row.matches_search(&needle));
+    rows.sort_by(|a, b| b.time().cmp(&a.time()).then(a.key().cmp(&b.key())));
+    rows
 }
 
 fn filter_buttons(ui: &mut egui::Ui, filter: &mut Filter) {
@@ -888,15 +936,7 @@ fn row_summary(
             let end = t.ended_ms.or(task_end).unwrap_or_else(now_ms);
             (
                 "TOOL",
-                format!(
-                    "{}{}",
-                    t.name,
-                    if t.compaction_id.is_some() {
-                        " · 压缩"
-                    } else {
-                        ""
-                    }
-                ),
+                row.operation_title(),
                 t.status.clone(),
                 compact_duration(end.saturating_sub(t.started_ms).max(0)),
                 "—".into(),
@@ -917,16 +957,7 @@ fn row_summary(
                 .unwrap_or_else(|| "—".into());
             (
                 "LLM",
-                format!(
-                    "{} · {}{}",
-                    r.model,
-                    tier_name(&r.service_tier),
-                    if r.compaction_id.is_some() {
-                        " · 压缩"
-                    } else {
-                        ""
-                    }
-                ),
+                row.operation_title(),
                 r.status.clone(),
                 elapsed,
                 r.output_tokens.map(number).unwrap_or_else(|| "—".into()),
@@ -935,7 +966,7 @@ fn row_summary(
         }
         TimelineRow::Compaction(c) => (
             "CMP",
-            "上下文压缩".into(),
+            row.operation_title(),
             c.status.clone(),
             observed_duration(c.started_ms, c.ended_ms),
             "—".into(),
@@ -1318,6 +1349,62 @@ fn shortened(value: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Search full commands regardless of case, combine with type, and restore history on clear.
+    #[test]
+    fn timeline_search_matches_operations_and_respects_type() {
+        let session = Session {
+            tools: vec![
+                Tool {
+                    id: "command".into(),
+                    name: "exec".into(),
+                    details: "cargo test --package Profiler".into(),
+                    started_ms: 10,
+                    ..Tool::default()
+                },
+                Tool {
+                    id: "web".into(),
+                    name: "web.search".into(),
+                    started_ms: 30,
+                    ..Tool::default()
+                },
+            ],
+            requests: vec![ModelRequest {
+                id: "model".into(),
+                model: "gpt-6.1-sol".into(),
+                service_tier: "fast".into(),
+                started_ms: Some(20),
+                ..ModelRequest::default()
+            }],
+            compactions: vec![Compaction {
+                id: "compression".into(),
+                started_ms: Some(40),
+                ..Compaction::default()
+            }],
+            ..Session::default()
+        };
+        for (filter, query, expected) in [
+            (Filter::All, " CARGO TEST ", vec!["command"]),
+            (Filter::Tools, "PROFILER", vec!["command"]),
+            (Filter::All, "web", vec!["web"]),
+            (Filter::Models, "GPT-6.1", vec!["model"]),
+            (Filter::All, "FAST", vec!["model"]),
+            (Filter::Tools, "gpt-6.1", vec![]),
+            (Filter::All, "压缩", vec!["compression"]),
+            (Filter::All, "missing", vec![]),
+            (
+                Filter::All,
+                "  ",
+                vec!["compression", "web", "model", "command"],
+            ),
+        ] {
+            let actual: Vec<_> = timeline_rows(&session, filter, query)
+                .iter()
+                .map(|row| row.key().1.to_owned())
+                .collect();
+            assert_eq!(actual, expected, "query: {query}");
+        }
+    }
 
     // Navigation must leave space for overview and resources at normal and compact heights.
     #[test]
