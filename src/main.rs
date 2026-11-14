@@ -6,6 +6,7 @@ mod model;
 mod pricing;
 mod resources;
 mod setup;
+mod stats;
 mod theme;
 mod ui;
 

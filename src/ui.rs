@@ -1,8 +1,10 @@
 use crate::collector;
 use crate::model::{
-    is_agent_tool, now_ms, AgentEvent, Compaction, ModelRequest, Session, Snapshot, Tool,
+    is_agent_tool, now_ms, AgentEvent, Compaction, CostSummary, ModelRequest, Session, Snapshot,
+    Tool,
 };
-use crate::{pricing, resources, theme};
+use crate::stats::SessionStats;
+use crate::{pricing, resources, stats, theme};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -365,7 +367,13 @@ impl eframe::App for Monitor {
                         .id_salt(("session_content", &s.id))
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            render_session(ui, s, &mut self.filter, &mut self.timeline_search)
+                            render_session(
+                                ui,
+                                s,
+                                &self.snapshot.sessions,
+                                &mut self.filter,
+                                &mut self.timeline_search,
+                            )
                         });
                     let minimized = ctx.input(|i| i.viewport().minimized == Some(true));
                     if is_active(s, now_ms()) && !minimized {
@@ -529,7 +537,13 @@ fn empty_state(ui: &mut egui::Ui) {
     });
 }
 
-fn render_session(ui: &mut egui::Ui, s: &Session, filter: &mut Filter, search: &mut String) {
+fn render_session(
+    ui: &mut egui::Ui,
+    s: &Session,
+    sessions: &[Session],
+    filter: &mut Filter,
+    search: &mut String,
+) {
     ui.label(
         RichText::new("SESSION OVERVIEW")
             .size(10.0)
@@ -553,10 +567,11 @@ fn render_session(ui: &mut egui::Ui, s: &Session, filter: &mut Filter, search: &
             meta_line(ui, "目录", &s.cwd);
         });
     ui.add_space(18.0);
-    metrics(ui, s);
-    cost_details(ui, s);
+    let totals = stats::rollup(s, sessions);
+    metrics(ui, s, &totals);
+    cost_details(ui, s, &totals);
     ui.add_space(20.0);
-    render_timeline(ui, s, filter, search);
+    render_timeline(ui, s, sessions, filter, search);
 }
 
 fn task_elapsed(s: &Session) -> Option<i64> {
@@ -569,7 +584,7 @@ fn task_elapsed(s: &Session) -> Option<i64> {
 }
 
 /// Cards keep primary metrics readable without placing large identity strings in the overview.
-fn metrics(ui: &mut egui::Ui, s: &Session) {
+fn metrics(ui: &mut egui::Ui, s: &Session, totals: &SessionStats<'_>) {
     let elapsed = task_elapsed(s);
     let tps = s
         .request_tps
@@ -588,13 +603,13 @@ fn metrics(ui: &mut egui::Ui, s: &Session) {
         (
             "模型请求速率",
             tps,
-            "tok/s · 最近一次有效请求".to_owned(),
+            "本会话 · 最近一次有效请求 tok/s".to_owned(),
             theme::PINK_SOFT,
         ),
         (
             "任务总耗时",
             elapsed.map(compact_duration).unwrap_or_else(|| "—".into()),
-            "当前轮次 · 本机观测".to_owned(),
+            "本会话当前轮次 · 本机观测".to_owned(),
             theme::YELLOW_SOFT,
         ),
         (
@@ -605,9 +620,13 @@ fn metrics(ui: &mut egui::Ui, s: &Session) {
         ),
         (
             "会话 API 估算",
-            session_cost(s),
-            if s.cost.unpriced_requests > 0 {
-                format!("部分估算 · {} 次未定价", s.cost.unpriced_requests)
+            session_cost(&totals.cost),
+            if totals.missing_children > 0 {
+                format!("部分汇总 · {} 个子会话未加载", totals.missing_children)
+            } else if totals.cost.unpriced_requests > 0 {
+                format!("部分估算 · {} 次未定价", totals.cost.unpriced_requests)
+            } else if totals.members.len() > 1 {
+                format!("全部轮次 · 含 {} 个已加载子会话", totals.members.len() - 1)
             } else {
                 "全部轮次 · 非订阅账单".into()
             },
@@ -753,7 +772,13 @@ fn timeline_frame() -> egui::Frame {
 }
 
 /// The timeline keeps column geometry identical for models and tools, regardless of title length.
-fn render_timeline(ui: &mut egui::Ui, s: &Session, filter: &mut Filter, search: &mut String) {
+fn render_timeline(
+    ui: &mut egui::Ui,
+    s: &Session,
+    sessions: &[Session],
+    filter: &mut Filter,
+    search: &mut String,
+) {
     ui.horizontal(|ui| {
         ui.label(RichText::new("运行时间线").size(15.0).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -789,7 +814,9 @@ fn render_timeline(ui: &mut egui::Ui, s: &Session, filter: &mut Filter, search: 
         ui.label(RichText::new("当前筛选暂无匹配的操作").color(theme::MUTED));
     }
     for row in rows.into_iter().take(300) {
-        ui.push_id((&s.id, row.key()), |ui| timeline_card(ui, row, s, columns));
+        ui.push_id((&s.id, row.key()), |ui| {
+            timeline_card(ui, row, s, sessions, columns)
+        });
         ui.add_space(5.0);
     }
 }
@@ -868,7 +895,13 @@ fn timeline_heading(ui: &mut egui::Ui) -> Columns {
     cols
 }
 
-fn timeline_card(ui: &mut egui::Ui, row: TimelineRow<'_>, session: &Session, columns: Columns) {
+fn timeline_card(
+    ui: &mut egui::Ui,
+    row: TimelineRow<'_>,
+    session: &Session,
+    sessions: &[Session],
+    columns: Columns,
+) {
     timeline_frame().show(ui, |ui| {
         let id = ui.make_persistent_id(row.key());
         let mut open =
@@ -883,8 +916,18 @@ fn timeline_card(ui: &mut egui::Ui, row: TimelineRow<'_>, session: &Session, col
         open.show_body_unindented(ui, |ui| {
             ui.add_space(6.0);
             match row {
-                TimelineRow::Tool(t) => tool_details(ui, t),
-                TimelineRow::Agent(e) => agent_details(ui, e),
+                TimelineRow::Tool(t) => {
+                    tool_details(ui, t);
+                    if is_agent_tool(t) {
+                        if let Some(event) = session.agent_events.iter().find(|e| e.id == t.id) {
+                            agent_stats(ui, event, sessions);
+                        }
+                    }
+                }
+                TimelineRow::Agent(e) => {
+                    agent_details(ui, e);
+                    agent_stats(ui, e, sessions);
+                }
                 TimelineRow::Model(r) => request_details(ui, r),
                 TimelineRow::Compaction(c) => compaction_details(ui, c, session),
             }
@@ -1023,7 +1066,24 @@ fn agent_details(ui: &mut egui::Ui, event: &AgentEvent) {
     meta_line(ui, "子会话", &event.thread_id);
     meta_line(ui, "子智能体", &event.path);
     meta_line(ui, "时间", &clock(Some(event.at_ms)));
-    ui.small("这是状态通知；模型速率、工具明细和费用请展开左侧子会话查看。");
+    ui.small("这是状态通知，通知本身不产生模型费用。");
+}
+
+/// Reuse the child overview; repeated timeline references never alter stored costs.
+fn agent_stats(ui: &mut egui::Ui, event: &AgentEvent, sessions: &[Session]) {
+    ui.separator();
+    let Some(child) = sessions
+        .iter()
+        .find(|s| !event.thread_id.is_empty() && s.id == event.thread_id)
+    else {
+        ui.small("子会话尚未加载，暂时无法显示统计。");
+        return;
+    };
+    ui.label(RichText::new("子会话当前统计").strong());
+    ui.small("速率、耗时及输出对应子会话当前轮次；费用为全部轮次累计，已按归属汇总到父会话。");
+    let totals = stats::rollup(child, sessions);
+    metrics(ui, child, &totals);
+    cost_details(ui, child, &totals);
 }
 
 fn tool_details(ui: &mut egui::Ui, tool: &Tool) {
@@ -1108,24 +1168,24 @@ fn money(value: f64) -> String {
     }
 }
 
-fn session_cost(s: &Session) -> String {
-    if s.cost.priced_requests == 0 {
+fn session_cost(cost: &CostSummary) -> String {
+    if cost.priced_requests == 0 {
         "—".into()
-    } else if s.cost.unpriced_requests > 0 {
-        format!("~{}", money(s.cost.total()))
+    } else if cost.unpriced_requests > 0 {
+        format!("~{}", money(cost.total()))
     } else {
-        money(s.cost.total())
+        money(cost.total())
     }
 }
 
-/// Costs aggregate observed requests across the whole chat, never reset at turn boundaries.
-fn cost_details(ui: &mut egui::Ui, s: &Session) {
+/// Show whole-chat owned costs, including descendants, without changing source usage records.
+fn cost_details(ui: &mut egui::Ui, s: &Session, totals: &SessionStats<'_>) {
     let title = RichText::new("成本明细 · API / USD")
         .size(10.0)
         .color(theme::MUTED);
     egui::CollapsingHeader::new(title).id_salt(("cost", &s.id)).show(ui, |ui| {
-        cost_grid(ui, s);
-        let cost = &s.cost;
+        cost_grid(ui, s, &totals.cost);
+        let cost = &totals.cost;
         let hit = if cost.input_tokens == 0 {
             "未知".into()
         } else {
@@ -1135,8 +1195,11 @@ fn cost_details(ui: &mut egui::Ui, s: &Session) {
         if cost.unpriced_requests > 0 {
             ui.small("当前总额是部分估算，未定价请求未被计为 $0。");
         }
-        ui.small(format!("本轮已观测：{} 次工具调用 · {} 次模型请求", s.tools.len(), s.requests.len()));
-        let note = "当前线程累计，子 agent 在各自线程单独计费。API 等价估算，非订阅账单；30m 缓存写入。基础 Standard 价格按每次请求档位调整，含已知长上下文规则；不含工具费用及区域附加费。";
+        ui.small(format!("本会话本轮已观测：{} 次工具调用 · {} 次模型请求", s.tools.len(), s.requests.len()));
+        if totals.members.len() > 1 || totals.missing_children > 0 {
+            cost_ownership(ui, totals);
+        }
+        let note = "全部轮次累计，含已加载的子智能体和侧边聊天，每个会话只计一次。API 等价估算，非订阅账单；30m 缓存写入。价格按每次请求档位调整，含已知长上下文规则；不含工具费用及区域附加费。";
         ui.label(RichText::new(note).small().color(theme::MUTED));
         ui.horizontal_wrapped(|ui| {
             ui.small(format!("价格快照 {}", pricing::AS_OF));
@@ -1145,8 +1208,32 @@ fn cost_details(ui: &mut egui::Ui, s: &Session) {
     });
 }
 
-fn cost_grid(ui: &mut egui::Ui, s: &Session) {
-    let c = &s.cost;
+/// Itemize each member's own cost so nested children remain easy to reconcile without double counting.
+fn cost_ownership(ui: &mut egui::Ui, totals: &SessionStats<'_>) {
+    ui.separator();
+    ui.strong("费用归属 · 各会话自身用量");
+    egui::Grid::new("cost_ownership")
+        .num_columns(2)
+        .show(ui, |ui| {
+            for (index, member) in totals.members.iter().enumerate() {
+                ui.label(if index == 0 {
+                    "本会话自身".into()
+                } else {
+                    display_title(member)
+                });
+                ui.monospace(session_cost(&member.cost));
+                ui.end_row();
+            }
+        });
+    if totals.missing_children > 0 {
+        ui.small(format!(
+            "{} 个关联子会话尚未加载，当前为部分汇总。",
+            totals.missing_children
+        ));
+    }
+}
+
+fn cost_grid(ui: &mut egui::Ui, s: &Session, c: &CostSummary) {
     let fresh = c.input_tokens.saturating_sub(
         c.cached_input_tokens
             .saturating_add(c.cache_write_input_tokens),
@@ -1400,6 +1487,68 @@ fn shortened(value: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Agent details resolve the exact child ID, show its existing TPS/cost, and keep missing data unknown.
+    #[test]
+    fn agent_overview_uses_child_identity_and_current_statistics() {
+        let sessions = vec![
+            Session {
+                id: "child".into(),
+                agent_name: "reviewer".into(),
+                request_tps: Some(12.5),
+                output_tokens: 321,
+                cost: CostSummary {
+                    output_usd: 2.0,
+                    priced_requests: 1,
+                    ..CostSummary::default()
+                },
+                ..Session::default()
+            },
+            Session {
+                id: "other-child".into(),
+                agent_name: "reviewer".into(),
+                request_tps: Some(99.9),
+                cost: CostSummary {
+                    output_usd: 99.0,
+                    priced_requests: 1,
+                    ..CostSummary::default()
+                },
+                ..Session::default()
+            },
+        ];
+        for (child_id, expected, absent) in [
+            (
+                "child",
+                vec!["12.5", "321", "$2.00"],
+                vec!["99.9", "$99.00"],
+            ),
+            ("missing", vec!["子会话尚未加载"], vec!["$0.00", "$2.00"]),
+        ] {
+            let context = egui::Context::default();
+            let event = AgentEvent {
+                thread_id: child_id.into(),
+                ..AgentEvent::default()
+            };
+            let output = context.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| agent_stats(ui, &event, &sessions));
+            });
+            let text = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            for value in expected {
+                assert!(text.contains(value), "missing {value}: {text}");
+            }
+            for value in absent {
+                assert!(!text.contains(value), "unexpected {value}: {text}");
+            }
+        }
+    }
 
     // Search full commands regardless of case, combine with type, and restore history on clear.
     #[test]
