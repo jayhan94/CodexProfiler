@@ -5,6 +5,8 @@ mod coverage_migration;
 mod hook;
 mod model;
 mod pricing;
+mod process_ownership;
+mod resource_tree;
 mod resources;
 mod setup;
 mod stats;

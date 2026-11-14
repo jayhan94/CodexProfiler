@@ -348,7 +348,8 @@ impl eframe::App for Monitor {
                 ui.add_space(12.0);
                 self.resources.set_visible(self.page == Page::Processes);
                 if self.page == Page::Processes {
-                    self.resources.show(ui, ctx);
+                    self.resources
+                        .show(ui, ctx, &self.snapshot.costs, self.selected.as_deref());
                     return;
                 }
                 if let Some(error) = &self.snapshot.error {
