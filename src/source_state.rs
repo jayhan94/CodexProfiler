@@ -25,6 +25,8 @@ pub(crate) struct SourceIssue {
     pub length: u64,
     pub modified_ns: Option<u64>,
     #[serde(default)]
+    pub missing_source: bool,
+    #[serde(default)]
     pub history_gap: bool,
     #[serde(default)]
     pub deferred_offset: Option<u64>,
@@ -33,6 +35,21 @@ pub(crate) struct SourceIssue {
 }
 
 impl SourceIssue {
+    /// Preserve held history and progress while the original log is temporarily unavailable.
+    pub fn missing(previous: Option<&Self>) -> Self {
+        Self {
+            kind: IssueKind::UnverifiedBilling,
+            offset: 0,
+            message: "历史日志暂不可用，已保留已采集的数据。未恢复的记录仍标为待核对。".into(),
+            length: previous.map_or(0, |issue| issue.length),
+            modified_ns: previous.and_then(|issue| issue.modified_ns),
+            missing_source: true,
+            history_gap: previous.is_some_and(|issue| issue.history_gap),
+            deferred_offset: previous.and_then(|issue| issue.deferred_offset),
+            tail_offset: previous.and_then(|issue| issue.tail_offset),
+        }
+    }
+
     pub fn new(kind: IssueKind, offset: u64, message: String, metadata: &Metadata) -> Self {
         Self {
             history_gap: kind == IssueKind::TruncatedHistory,
@@ -41,6 +58,7 @@ impl SourceIssue {
             message,
             length: metadata.len(),
             modified_ns: modified_ns(metadata),
+            missing_source: false,
             deferred_offset: None,
             tail_offset: None,
         }
@@ -56,6 +74,9 @@ impl SourceIssue {
 
     /// Repaired or replaced content may have shifted earlier byte positions; receipts make replay safe.
     pub fn retry_offset(&self, committed: u64, metadata: &Metadata) -> u64 {
+        if self.missing_source {
+            return 0;
+        }
         match self.kind {
             IssueKind::InvalidRecord if metadata.len() <= self.length => 0,
             IssueKind::UnverifiedBilling
@@ -73,6 +94,7 @@ impl SourceIssue {
     pub fn repaired(&self) -> Option<Self> {
         self.history_gap.then(|| Self {
             kind: IssueKind::TruncatedHistory,
+            missing_source: false,
             message: "来源历史曾被截短，已保留可确认的费用".into(),
             ..self.clone()
         })
@@ -230,6 +252,28 @@ pub(crate) fn save_issue(db: &Connection, path: &Path, issue: Option<&SourceIssu
 mod tests {
     use super::*;
 
+    // Disappearance preserves deferred billing work; recovery starts at metadata rather than a held live tail.
+    #[test]
+    fn missing_source_preserves_held_history_and_replays_from_zero() {
+        let path = source_file("missing-held", b"restored\n");
+        let metadata = path.metadata().unwrap();
+        let mut previous =
+            SourceIssue::new(IssueKind::UnverifiedBilling, 2, "pending".into(), &metadata);
+        previous.history_gap = true;
+        previous.deferred_offset = Some(2);
+        previous.tail_offset = Some(9);
+        let missing = SourceIssue::missing(Some(&previous));
+        assert!(missing.missing_source);
+        assert!(missing.history_gap);
+        assert_eq!(missing.deferred_offset, Some(2));
+        assert_eq!(missing.tail_offset, Some(9));
+        assert_eq!(missing.retry_offset(2, &metadata), 0);
+        let repaired = missing.repaired().unwrap();
+        assert!(!repaired.missing_source);
+        assert_eq!(repaired.kind, IssueKind::TruncatedHistory);
+        std::fs::remove_file(path).unwrap();
+    }
+
     // Adding the issue column and recording a failure must preserve an existing committed cursor.
     #[test]
     fn issue_schema_preserves_source_cursor_and_round_trips() {
@@ -247,6 +291,7 @@ mod tests {
             message: "invalid record".into(),
             length: 100,
             modified_ns: Some(1),
+            missing_source: false,
             history_gap: false,
             deferred_offset: None,
             tail_offset: None,

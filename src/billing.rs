@@ -2,7 +2,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Error as IoError, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 pub(crate) type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -25,6 +25,7 @@ pub(crate) struct SourceProblem {
     pub path: PathBuf,
     pub offset: u64,
     pub message: String,
+    pub missing_source: bool,
 }
 
 pub(crate) fn ensure_schema(db: &Connection) -> Result<()> {
@@ -243,6 +244,7 @@ pub(crate) fn migrate(db: &mut Connection) -> Result<Vec<SourceProblem>> {
                 path: PathBuf::new(),
                 offset: 0,
                 message: format!("会话 {owner} 的已知近期响应未出现在已验证来源中"),
+                missing_source: false,
             });
         }
         if complete && actual != expected {
@@ -253,6 +255,7 @@ pub(crate) fn migrate(db: &mut Connection) -> Result<Vec<SourceProblem>> {
                 message: format!(
                     "会话 {owner} 已计费次数 {expected} 与唯一响应 {actual} 不一致，保留原费用并标记未验证"
                 ),
+                missing_source: false,
             });
         }
         tx.execute(
@@ -447,6 +450,9 @@ fn seed_source(
         path: path.to_path_buf(),
         offset: position,
         message: error.to_string(),
+        missing_source: error
+            .downcast_ref::<IoError>()
+            .is_some_and(|error| error.kind() == ErrorKind::NotFound),
     })
 }
 

@@ -1,7 +1,7 @@
 use crate::collector;
 use crate::model::{
     is_agent_tool, now_ms, AgentEvent, Compaction, CostMember, CostSummary, ModelRequest, Session,
-    Snapshot, Tool, TurnTimeline,
+    Snapshot, SourceNotice, Tool, TurnTimeline,
 };
 use crate::stats::SessionStats;
 use crate::{pricing, resources, stats, theme};
@@ -373,6 +373,7 @@ impl eframe::App for Monitor {
                                 s,
                                 &self.snapshot.sessions,
                                 &self.snapshot.costs,
+                                &self.snapshot.source_notices,
                                 &mut self.filter,
                                 &mut self.timeline_search,
                             )
@@ -544,6 +545,7 @@ fn render_session(
     s: &Session,
     sessions: &[Session],
     costs: &[CostMember],
+    source_notices: &[SourceNotice],
     filter: &mut Filter,
     search: &mut String,
 ) {
@@ -573,8 +575,49 @@ fn render_session(
     let totals = stats::rollup(s, sessions, costs);
     metrics(ui, s, &totals);
     cost_details(ui, s, &totals);
+    render_source_notices(ui, s, &totals, source_notices);
     ui.add_space(20.0);
     render_timeline(ui, s, sessions, costs, filter, search);
+}
+
+/// Use established cost ownership so unrelated or merely referenced chats stay separate.
+fn source_notices_for_members<'a>(
+    notices: &'a [SourceNotice],
+    totals: &SessionStats,
+) -> Vec<&'a SourceNotice> {
+    notices
+        .iter()
+        .filter(|notice| {
+            totals
+                .members
+                .iter()
+                .any(|member| member.id == notice.thread_id)
+        })
+        .collect()
+}
+
+/// Keep source availability beside session costs, with the affected path available on expansion.
+fn render_source_notices(
+    ui: &mut egui::Ui,
+    s: &Session,
+    totals: &SessionStats,
+    notices: &[SourceNotice],
+) {
+    let notices = source_notices_for_members(notices, totals);
+    if notices.is_empty() {
+        return;
+    }
+    let title = RichText::new(format!("采集提示 · {}", notices.len()))
+        .size(10.0)
+        .color(theme::MUTED);
+    egui::CollapsingHeader::new(title)
+        .id_salt(("source_notices", &s.id))
+        .show(ui, |ui| {
+            for notice in notices {
+                ui.label(RichText::new(&notice.message).small().color(theme::MUTED));
+                meta_line(ui, "来源", &notice.path);
+            }
+        });
 }
 
 fn task_elapsed(s: &Session) -> Option<i64> {
@@ -1630,6 +1673,83 @@ fn shortened(value: &str, limit: usize) -> String {
 mod tests {
     use super::*;
     use crate::model;
+
+    fn source_notice(thread_id: &str) -> SourceNotice {
+        SourceNotice {
+            thread_id: thread_id.into(),
+            path: format!("rollout-{thread_id}.jsonl"),
+            message: "历史日志暂不可用，已保留已采集的数据。未恢复的记录仍标为待核对。".into(),
+        }
+    }
+
+    // Notices include the selected chat and indexed descendants, never forks or unowned references.
+    #[test]
+    fn source_notices_follow_only_rollup_members() {
+        let mut parent = session("parent", 1, false);
+        parent.agent_events = vec![AgentEvent {
+            thread_id: "referenced".into(),
+            ..AgentEvent::default()
+        }];
+        let children = [
+            child("owned", "parent", 2, false, "subagent"),
+            child("nested", "owned", 3, false, "side_chat"),
+            child("foreign", "other", 4, false, "subagent"),
+            child("fork", "parent", 5, false, "conversation"),
+        ];
+        let costs: Vec<_> = children.iter().map(CostMember::from_session).collect();
+        let notices =
+            ["parent", "owned", "nested", "foreign", "fork", "referenced"].map(source_notice);
+        for (selected, expected) in [
+            (&parent, vec!["parent", "owned", "nested"]),
+            (&children[0], vec!["owned", "nested"]),
+        ] {
+            // The ownership index remains usable even when child timelines are not cached.
+            let totals = stats::rollup(selected, &[], &costs);
+            let actual: Vec<_> = source_notices_for_members(&notices, &totals)
+                .iter()
+                .map(|notice| notice.thread_id.as_str())
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    // Expanded notices retain the friendly explanation and source path; unaffected chats show none.
+    #[test]
+    fn session_source_notices_render_paths_only_for_affected_chats() {
+        let notices = [source_notice("selected"), source_notice("unrelated")];
+        for (id, affected) in [("selected", true), ("no-notice", false)] {
+            let selected = session(id, 1, false);
+            let context = egui::Context::default();
+            // egui's test visibility flag expands nested headers without relying on private UI IDs.
+            context.memory_mut(|memory| memory.set_everything_is_visible(true));
+            let output = context.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_session(
+                        ui,
+                        &selected,
+                        &[],
+                        &[],
+                        &notices,
+                        &mut Filter::All,
+                        &mut String::new(),
+                    );
+                });
+            });
+            let text = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            for expected in ["采集提示 · 1", &notices[0].message, &notices[0].path] {
+                assert_eq!(text.contains(expected), affected, "{expected}: {text}");
+            }
+            assert!(!text.contains(&notices[1].path), "{text}");
+        }
+    }
 
     // An unpriced child keeps the parent's known amount partial; late usage clears it after restart.
     #[test]

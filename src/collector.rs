@@ -1,5 +1,5 @@
 use crate::billing::{Decision, ReceiptKey};
-use crate::model::{self, CostMember, CostSummary, Session, Snapshot};
+use crate::model::{self, CostMember, CostSummary, Session, Snapshot, SourceNotice};
 use crate::source_state::{IssueKind, SourceIssue};
 use crate::{billing, coverage_migration, source_state};
 use eframe::egui;
@@ -8,8 +8,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{value::RawValue, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::error::Error;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Error as IoError, ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -31,6 +32,7 @@ pub fn start(home: PathBuf, db_path: PathBuf, ctx: egui::Context) -> mpsc::Recei
             let _ = tx.try_send(Snapshot {
                 sessions: Vec::new(),
                 costs: Vec::new(),
+                source_notices: Vec::new(),
                 error: Some(error.to_string()),
                 updated_ms: model::now_ms(),
             });
@@ -357,14 +359,65 @@ impl IngestBatch {
     }
 }
 
+type SourceCheckpoint = Option<(u64, String, Option<String>)>;
+
 struct SourceRead {
     offset: u64,
     thread_id: String,
-    expected: Option<(u64, String, Option<String>)>,
+    expected: SourceCheckpoint,
     issue: Option<SourceIssue>,
     deferred: Option<u64>,
     initial_stamp: source_state::SourceStamp,
     needs_stamp: bool,
+    verify_owner: bool,
+}
+
+impl SourceRead {
+    /// Unverified replacement content cannot become the original source's committed audit prefix.
+    fn progress(
+        &self,
+        batch: &mut IngestBatch,
+        next: u64,
+        metadata: &fs::Metadata,
+    ) -> SourceProgress {
+        if self.verify_owner {
+            return SourceProgress {
+                committed: self.expected.as_ref().map_or(0, |checkpoint| checkpoint.0),
+                scanned: self.offset,
+            };
+        }
+        batch.progress(next, metadata)
+    }
+}
+
+/// Reuse the durable cursor, owner and issue as the source transaction's comparison token.
+fn source_checkpoint(db: &Connection, path: &Path) -> Result<SourceCheckpoint> {
+    Ok(db
+        .query_row(
+            "SELECT offset,thread_id,issue FROM sources WHERE path=?1",
+            [path.to_string_lossy().as_ref()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?)
+}
+
+/// Missing history is recoverable only when its durable owner is already known.
+fn save_missing_source(db: &Connection, path: &Path) -> Result<Option<SourceIssue>> {
+    if !is_rollout(path) {
+        return Ok(None);
+    }
+    let Some((_, owner, stored)) = source_checkpoint(db, path)? else {
+        return Ok(None);
+    };
+    if owner.is_empty() {
+        return Ok(None);
+    }
+    let previous: Option<SourceIssue> = stored
+        .map(|value| serde_json::from_str(&value))
+        .transpose()?;
+    let issue = SourceIssue::missing(previous.as_ref());
+    source_state::save_issue(db, path, Some(&issue))?;
+    Ok(Some(issue))
 }
 
 /// Historical ownership and costs stay resident without retaining historical tool bodies.
@@ -508,7 +561,14 @@ impl Store {
         }
         let mut diagnostics = Vec::new();
         for problem in billing::migrate(&mut db)? {
-            diagnostics.push(problem.message.clone());
+            if problem.missing_source && save_missing_source(&db, &problem.path)?.is_some() {
+                continue;
+            }
+            diagnostics.push(if problem.path.as_os_str().is_empty() {
+                problem.message.clone()
+            } else {
+                format!("{}: {}", problem.path.display(), problem.message)
+            });
             if problem.path.as_os_str().is_empty() {
                 continue;
             }
@@ -527,6 +587,7 @@ impl Store {
                     message: problem.message,
                     length: 0,
                     modified_ns: None,
+                    missing_source: false,
                     history_gap: false,
                     deferred_offset: None,
                     tail_offset: None,
@@ -635,9 +696,71 @@ impl Store {
         Snapshot {
             sessions,
             costs: self.cost_snapshot(),
+            source_notices: self.source_notices(),
             error: self.error.clone(),
             updated_ms: model::now_ms(),
         }
+    }
+
+    /// Publish localized missing-history context without assigning it to unrelated chats.
+    fn source_notices(&self) -> Vec<SourceNotice> {
+        let mut notices: Vec<_> = self
+            .source_issues
+            .iter()
+            .filter_map(|(path, issue)| {
+                let (_, owner) = self.source_offsets.get(path)?;
+                if !issue.missing_source || owner.is_empty() {
+                    return None;
+                }
+                Some(SourceNotice {
+                    thread_id: owner.clone(),
+                    path: path.to_string_lossy().into_owned(),
+                    message: issue.message.clone(),
+                })
+            })
+            .collect();
+        notices.sort_by(|a, b| a.thread_id.cmp(&b.thread_id).then(a.path.cmp(&b.path)));
+        notices
+    }
+
+    /// Only known, missing rollout files become session notices; other failures remain actionable errors.
+    fn record_read_failure(&mut self, path: &Path, error: &(dyn Error + Send + Sync + 'static)) {
+        let missing = error
+            .downcast_ref::<IoError>()
+            .is_some_and(|error| error.kind() == ErrorKind::NotFound);
+        let result = if missing {
+            save_missing_source(&self.db, path)
+        } else {
+            Ok(None)
+        };
+        match result {
+            Ok(Some(issue)) => {
+                self.source_issues.insert(path.to_owned(), issue);
+                self.clear_source_error(path);
+            }
+            Ok(None) => self.error = Some(format!("{}: {error}", path.display())),
+            Err(save_error) => {
+                self.error = Some(format!(
+                    "{}: {error}; 记录采集提示失败：{save_error}",
+                    path.display()
+                ))
+            }
+        }
+        self.failed_sources.insert(path.to_owned());
+    }
+
+    /// Recovering one source must not erase independent diagnostics collected at startup.
+    fn clear_source_error(&mut self, path: &Path) {
+        let Some(message) = self.error.take() else {
+            return;
+        };
+        let prefix = format!("{}:", path.display());
+        let remaining = message
+            .lines()
+            .filter(|line| !line.starts_with(&prefix))
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.error = (!remaining.is_empty()).then_some(remaining);
     }
 
     fn cost_snapshot(&self) -> Vec<CostMember> {
@@ -768,9 +891,7 @@ impl Store {
                     match catalog_entry(entry.path()) {
                         Ok(Some(source)) => self.register_source(entry.path(), source)?,
                         Ok(None) => (),
-                        Err(error) => {
-                            self.error = Some(format!("{}: {error}", entry.path().display()))
-                        }
+                        Err(error) => self.record_read_failure(entry.path(), error.as_ref()),
                     }
                 }
             }
@@ -908,7 +1029,7 @@ impl Store {
         };
         if source.offset == metadata.len() {
             if batch.issue.is_some() || source.needs_stamp {
-                let progress = batch.progress(source.offset, &metadata);
+                let progress = source.progress(&mut batch, source.offset, &metadata);
                 self.commit(path, progress, &source.thread_id, &source.expected, &batch)?;
             }
             return Ok(false);
@@ -931,7 +1052,7 @@ impl Store {
             self.rollback_batch(&batch)?;
             return Err("来源在读取期间被替换，请重试".into());
         }
-        let progress = batch.progress(next, &metadata);
+        let progress = source.progress(&mut batch, next, &metadata);
         if let Err(error) = self.commit(path, progress, &source.thread_id, &source.expected, &batch)
         {
             self.rollback_batch(&batch)?;
@@ -942,7 +1063,10 @@ impl Store {
             .issue
             .as_ref()
             .is_some_and(|issue| issue.kind == IssueKind::InvalidRecord);
-        Ok(!blocked && next < metadata.len() && bytes.len() as u64 == CHUNK_BYTES)
+        Ok(!blocked
+            && !source.verify_owner
+            && next < metadata.len()
+            && bytes.len() as u64 == CHUNK_BYTES)
     }
 
     fn prepare_source(
@@ -950,25 +1074,13 @@ impl Store {
         path: &Path,
         metadata: &fs::Metadata,
     ) -> Result<Option<SourceRead>> {
-        let expected = self
-            .db
-            .query_row(
-                "SELECT offset,thread_id,issue FROM sources WHERE path=?1",
-                [path.to_string_lossy().as_ref()],
-                |row| {
-                    Ok((
-                        row.get::<_, u64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                },
-            )
-            .optional()?;
+        let expected = source_checkpoint(&self.db, path)?;
         let (committed, thread_id, stored) = expected.clone().unwrap_or_default();
         let mut offset = committed;
         let mut issue: Option<SourceIssue> = stored
             .map(|value| serde_json::from_str(&value))
             .transpose()?;
+        let verify_owner = issue.as_ref().is_some_and(|issue| issue.missing_source);
         let previous = source_state::load_stamp(&self.db, path)?;
         let replaced = match &previous {
             Some(stamp) => source_state::changed_prefix(path, stamp, metadata)?,
@@ -992,14 +1104,18 @@ impl Store {
                 return Ok(None);
             }
             if settled {
-                issue = if existing.kind == IssueKind::UnverifiedBilling {
+                issue = if existing.kind == IssueKind::UnverifiedBilling && !existing.missing_source
+                {
                     existing.repaired()
                 } else {
                     Some(existing.clone())
                 };
             } else {
                 offset = existing.retry_offset(committed, metadata);
-                if !replaced && existing.kind != IssueKind::InvalidRecord {
+                if !replaced
+                    && existing.kind != IssueKind::InvalidRecord
+                    && !existing.missing_source
+                {
                     if let Some(tail) = existing.tail_offset.filter(|tail| *tail <= metadata.len())
                     {
                         offset = tail;
@@ -1007,22 +1123,29 @@ impl Store {
                 }
                 if !replaced && offset > committed {
                     deferred = existing.deferred_offset;
-                } else if existing.kind == IssueKind::UnverifiedBilling {
+                } else if existing.kind == IssueKind::UnverifiedBilling && !existing.missing_source
+                {
                     issue = existing.repaired();
                 }
             }
         }
-        if replaced {
+        if replaced || verify_owner {
             offset = 0;
             deferred = None;
         }
         if shrunk {
-            issue = Some(SourceIssue::new(
-                IssueKind::TruncatedHistory,
-                committed,
-                "来源已截短，保留已有费用并重新读取现有记录".into(),
-                metadata,
-            ));
+            if verify_owner {
+                if let Some(issue) = &mut issue {
+                    issue.history_gap = true;
+                }
+            } else {
+                issue = Some(SourceIssue::new(
+                    IssueKind::TruncatedHistory,
+                    committed,
+                    "来源已截短，保留已有费用并重新读取现有记录".into(),
+                    metadata,
+                ));
+            }
             offset = 0;
             deferred = None;
         }
@@ -1035,6 +1158,7 @@ impl Store {
             deferred,
             initial_stamp,
             needs_stamp: previous.is_none(),
+            verify_owner,
         }))
     }
 
@@ -1057,7 +1181,19 @@ impl Store {
             }
             let problem = match thin_record(record) {
                 Ok(Some(row)) => {
-                    self.apply_record(&row, &mut source.thread_id, batch, position == 0)?
+                    if source.verify_owner
+                        && (row["type"] != "session_meta"
+                            || row["payload"]["id"].as_str() != Some(source.thread_id.as_str()))
+                    {
+                        Some((
+                            IssueKind::InvalidRecord,
+                            "恢复的日志缺少匹配本会话的首条元数据".into(),
+                        ))
+                    } else {
+                        let first = position == 0 || source.verify_owner;
+                        source.verify_owner = false;
+                        self.apply_record(&row, &mut source.thread_id, batch, first)?
+                    }
                 }
                 Ok(None) => None,
                 Err(error) => Some((
@@ -1086,6 +1222,7 @@ impl Store {
                     IssueKind::InvalidRecord | IssueKind::UnverifiedBilling
                 ) && source.offset + consumed > old.offset
                     && batch.deferred.is_none()
+                    && !source.verify_owner
                 {
                     batch.issue = old.repaired();
                 }
@@ -1220,24 +1357,12 @@ impl Store {
         path: &Path,
         progress: SourceProgress,
         thread_id: &str,
-        expected_source: &Option<(u64, String, Option<String>)>,
+        expected_source: &SourceCheckpoint,
         batch: &IngestBatch,
     ) -> Result<()> {
         let stamp = source_state::capture_stamp(path, progress.scanned)?;
         let transaction = self.db.transaction()?;
-        let current = transaction
-            .query_row(
-                "SELECT offset,thread_id,issue FROM sources WHERE path=?1",
-                [path.to_string_lossy().as_ref()],
-                |row| {
-                    Ok((
-                        row.get::<_, u64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                },
-            )
-            .optional()?;
+        let current = source_checkpoint(&transaction, path)?;
         if &current != expected_source {
             return Err("source advanced in another Profiler window; retry required".into());
         }
@@ -1278,16 +1403,12 @@ impl Store {
         }
         if let Some(issue) = &batch.issue {
             self.source_issues.insert(path.to_owned(), issue.clone());
+            if issue.kind == IssueKind::TruncatedHistory {
+                self.clear_source_error(path);
+            }
         } else {
             self.source_issues.remove(path);
-            let prefix = format!("{}:", path.display());
-            if self
-                .error
-                .as_ref()
-                .is_some_and(|message| message.starts_with(&prefix))
-            {
-                self.error = None;
-            }
+            self.clear_source_error(path);
         }
         if batch
             .issue
@@ -1541,8 +1662,7 @@ fn process_queued(
         Ok(true) => enqueue(path, queue, queued),
         Ok(false) => (),
         Err(error) => {
-            store.error = Some(format!("{}: {error}", path.display()));
-            store.failed_sources.insert(path);
+            store.record_read_failure(&path, error.as_ref());
         }
     }
     for path in store.pending_family_paths() {
@@ -1590,6 +1710,186 @@ fn handle_event(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    // A deleted old log becomes a notice for its owner after restart, preserving every cached cost and cursor.
+    #[test]
+    fn missing_history_is_scoped_after_restart_without_losing_cache() {
+        let dir = fixture("missing-history-notice");
+        let missing = dir.join("rollout-missing.jsonl");
+        fs::write(
+            &missing,
+            serde_json::json!({"type":"session_meta","payload":{
+            "id":"missing","source":"vscode"}})
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let healthy = write_cost_rollout(&dir, "healthy", "healthy", "", 100, 7);
+        let db = dir.join("state.sqlite");
+        let mut store = Store::open(&db).unwrap();
+        store.ingest(&missing).unwrap();
+        store.ingest(&healthy).unwrap();
+        let offset = store.source_offsets[&missing].0;
+        let stamp = source_state::load_stamp(&store.db, &missing).unwrap();
+        drop(store);
+        fs::remove_file(&missing).unwrap();
+        for _ in 0..2 {
+            let store = Store::open(&db).unwrap();
+            let snapshot = store.snapshot();
+            assert!(snapshot.error.is_none());
+            assert_eq!(snapshot.source_notices.len(), 1);
+            assert_eq!(snapshot.source_notices[0].thread_id, "missing");
+            assert_eq!(snapshot.source_notices[0].path, missing.to_string_lossy());
+            assert_eq!(store.source_offsets[&missing].0, offset);
+            assert_eq!(
+                source_state::load_stamp(&store.db, &missing).unwrap(),
+                stamp
+            );
+            assert_eq!(
+                store.costs["healthy"].cost.as_ref().unwrap().output_tokens,
+                7
+            );
+            assert!(
+                snapshot
+                    .costs
+                    .iter()
+                    .find(|m| m.id == "missing")
+                    .unwrap()
+                    .partial
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // A deletion during queued ingestion stays local; restoring the original file clears it without recharging.
+    #[test]
+    fn missing_runtime_source_recovers_without_duplicate_fees_or_retry_loop() {
+        let dir = fixture("missing-live-source");
+        let file = write_cost_rollout(&dir, "first", "chat", "", 100, 7);
+        let original = fs::read(&file).unwrap();
+        let mut store = Store::open(&dir.join("state.sqlite")).unwrap();
+        store.ingest(&file).unwrap();
+        let offset = store.source_offsets[&file].0;
+        let stamp = source_state::load_stamp(&store.db, &file).unwrap();
+        fs::remove_file(&file).unwrap();
+        let mut queue = VecDeque::new();
+        let mut queued = HashSet::new();
+        let index = dir.join("session_index.jsonl");
+        process_queued(&mut store, file.clone(), &index, &mut queue, &mut queued);
+        assert!(store.error.is_none());
+        assert!(queue.is_empty());
+        assert_eq!(store.source_notices().len(), 1);
+        assert_eq!(store.source_offsets[&file].0, offset);
+        assert_eq!(source_state::load_stamp(&store.db, &file).unwrap(), stamp);
+        fs::write(&file, original).unwrap();
+        process_queued(&mut store, file.clone(), &index, &mut queue, &mut queued);
+        assert!(store.source_notices().is_empty());
+        assert!(!store.failed_sources.contains(&file));
+        assert_eq!(store.sessions["chat"].cost.output_tokens, 7);
+        assert_eq!(store.sessions["chat"].cost.priced_requests, 1);
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Empty recovery cannot prove availability; a foreign header cannot attach new fees to the original owner.
+    #[test]
+    fn missing_source_recovery_requires_matching_metadata() {
+        let dir = fixture("missing-source-owner");
+        let file = write_cost_rollout(&dir, "first", "chat", "", 100, 7);
+        let mut store = Store::open(&dir.join("state.sqlite")).unwrap();
+        store.ingest(&file).unwrap();
+        fs::remove_file(&file).unwrap();
+        store.record_read_failure(&file, &IoError::from(ErrorKind::NotFound));
+        fs::write(&file, b"\n").unwrap();
+        store.ingest(&file).unwrap();
+        assert!(store.source_issues[&file].missing_source);
+        assert!(store.source_issues[&file].history_gap);
+        fs::write(
+            &file,
+            serde_json::json!({"type":"session_meta","payload":{"id":"other"}}).to_string() + "\n",
+        )
+        .unwrap();
+        store.ingest(&file).unwrap();
+        assert_eq!(store.source_issues[&file].kind, IssueKind::InvalidRecord);
+        assert!(store
+            .error
+            .as_ref()
+            .unwrap()
+            .contains(file.to_string_lossy().as_ref()));
+        assert_eq!(store.sessions["chat"].cost.output_tokens, 7);
+        assert_eq!(store.sessions["chat"].cost.priced_requests, 1);
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Permission failures and unowned missing files remain global diagnostics with concrete paths.
+    #[test]
+    fn nonhistorical_read_errors_are_not_hidden() {
+        let dir = fixture("unscoped-source-failure");
+        let file = write_cost_rollout(&dir, "first", "chat", "", 100, 7);
+        let mut store = Store::open(&dir.join("state.sqlite")).unwrap();
+        store.ingest(&file).unwrap();
+        let unknown = dir.join("rollout-unowned.jsonl");
+        for (path, kind) in [
+            (&file, ErrorKind::PermissionDenied),
+            (&unknown, ErrorKind::NotFound),
+        ] {
+            store.record_read_failure(path, &IoError::from(kind));
+            assert!(store.source_notices().is_empty());
+            assert!(store
+                .error
+                .as_ref()
+                .unwrap()
+                .contains(path.to_string_lossy().as_ref()));
+        }
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Reclassifying and then restoring A leaves B's independent global error visible throughout.
+    #[test]
+    fn missing_source_does_not_clear_other_global_diagnostics() {
+        let dir = fixture("independent-source-diagnostics");
+        let file = write_cost_rollout(&dir, "first", "chat", "", 100, 7);
+        let mut store = Store::open(&dir.join("state.sqlite")).unwrap();
+        store.ingest(&file).unwrap();
+        let other = format!(
+            "{}: permission denied",
+            dir.join("rollout-other.jsonl").display()
+        );
+        store.error = Some(format!("{}: invalid JSON\n{other}", file.display()));
+        store.record_read_failure(&file, &IoError::from(ErrorKind::NotFound));
+        assert_eq!(store.error.as_deref(), Some(other.as_str()));
+        store.ingest(&file).unwrap();
+        assert_eq!(store.error.as_deref(), Some(other.as_str()));
+        assert!(store.source_notices().is_empty());
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // A restored non-transcript stops after one chunk and cannot move the original audit cursor.
+    #[test]
+    fn missing_source_without_metadata_does_not_spin_or_commit_foreign_progress() {
+        let dir = fixture("missing-source-no-metadata");
+        let file = write_cost_rollout(&dir, "first", "chat", "", 100, 7);
+        let mut store = Store::open(&dir.join("state.sqlite")).unwrap();
+        store.ingest(&file).unwrap();
+        let offset = store.source_offsets[&file].0;
+        fs::remove_file(&file).unwrap();
+        store.record_read_failure(&file, &IoError::from(ErrorKind::NotFound));
+        let row = serde_json::json!({"type":"response_item","payload":{
+            "type":"message","role":"assistant","content":"x".repeat(64*1024)}})
+        .to_string()
+            + "\n";
+        fs::write(&file, row.repeat(CHUNK_BYTES as usize / row.len() + 2)).unwrap();
+        assert!(!store.ingest(&file).unwrap());
+        assert_eq!(store.source_offsets[&file].0, offset);
+        assert_eq!(store.source_notices().len(), 1);
+        assert_eq!(store.sessions["chat"].cost.output_tokens, 7);
+        assert!(store.error.is_none());
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     // Unknown old history does not block safe live fees; once proof returns the held prefix is replayed.
     #[test]

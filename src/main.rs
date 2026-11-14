@@ -153,7 +153,8 @@ fn headless(options: Options, seconds: u64) {
             .collect();
         println!(
             "{}",
-            serde_json::json!({"sessions": sessions, "error": snapshot.error})
+            serde_json::json!({"sessions": sessions, "error": snapshot.error,
+                "source_notices": snapshot.source_notices})
         );
         if failed {
             std::process::exit(1);

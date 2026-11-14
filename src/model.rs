@@ -7,8 +7,18 @@ use std::mem;
 pub struct Snapshot {
     pub sessions: Vec<Session>,
     pub costs: Vec<CostMember>,
+    pub source_notices: Vec<SourceNotice>,
     pub error: Option<String>,
     pub updated_ms: i64,
+}
+
+/// Recoverable history problems belong to their owning chat, rather than every open chat.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SourceNotice {
+    pub thread_id: String,
+    pub path: String,
+    pub message: String,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
