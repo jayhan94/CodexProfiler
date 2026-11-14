@@ -1268,7 +1268,6 @@ fn request_details(ui: &mut egui::Ui, r: &ModelRequest) {
             theme::INK,
         );
     });
-    meta_line(ui, "档位来源", &r.service_tier_source);
     for (label, value) in request_token_rows(r) {
         meta_line(ui, label, &value);
     }
