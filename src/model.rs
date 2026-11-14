@@ -38,6 +38,7 @@ pub struct Session {
     pub service_tier_source: String,
     pub tier_history: Vec<(i64, String, String)>,
     pub service_tier_updated_ms: i64,
+    pub effort_history: Vec<(i64, Option<String>)>,
     pub compactions: Vec<Compaction>,
     pub active_compaction: Option<String>,
     pub phase: String,
@@ -120,6 +121,8 @@ pub struct ModelRequest {
     pub service_tier: String,
     #[serde(default = "assumed_tier_source")]
     pub service_tier_source: String,
+    pub reasoning_effort: Option<String>,
+    pub reasoning_effort_source: String,
     pub compaction_id: Option<String>,
     pub started_ms: Option<i64>,
     pub ended_ms: Option<i64>,
@@ -898,6 +901,7 @@ pub fn apply_with_billing(s: &mut Session, row: &Value, allow_charge: bool) {
     // Billing follows canonical response ownership, independently of the displayed latest turn.
     remember_billing_model(s, row);
     observe_service_tier(s, row, ts);
+    observe_reasoning_effort(s, row, ts);
     let mut new_usage = false;
     if row["type"] == "token_usage_record" {
         let changed = account_usage(s, p, ts, allow_charge);
@@ -1051,6 +1055,77 @@ fn request_tier(s: &Session, p: &Value, ts: i64) -> (String, String) {
         );
     }
     tier_at(s, ts)
+}
+
+/// Recorded settings apply to requests that start afterwards; null means the effort is unknown.
+fn observe_reasoning_effort(s: &mut Session, row: &Value, ts: i64) {
+    let p = &row["payload"];
+    let value = if row["type"] == "turn_context" {
+        p.get("effort")
+    } else if p["type"] == "thread_settings_applied" {
+        p["thread_settings"].get("reasoning_effort")
+    } else {
+        None
+    };
+    let Some(value) = value else {
+        return;
+    };
+    let effort = normalized_effort(value);
+    if s.effort_history
+        .iter()
+        .any(|(time, old)| *time == ts && old == &effort)
+    {
+        return;
+    }
+    s.effort_history.push((ts, effort.clone()));
+    s.effort_history.sort_by_key(|(time, _)| *time);
+    if s.effort_history.len() > 512 {
+        s.effort_history.remove(0);
+    }
+    let next = s
+        .effort_history
+        .iter()
+        .find(|(time, _)| *time > ts)
+        .map(|(time, _)| *time);
+    // Late source delivery can fill the original snapshot, including an already archived turn.
+    for request in s.requests.iter_mut().chain(
+        s.timeline_history
+            .iter_mut()
+            .flat_map(|turn| &mut turn.requests),
+    ) {
+        if request.reasoning_effort_source != "request"
+            && request
+                .started_ms
+                .is_some_and(|start| start >= ts && next.is_none_or(|end| start < end))
+        {
+            request.reasoning_effort = effort.clone();
+            request.reasoning_effort_source = "settings".into();
+        }
+    }
+}
+
+fn normalized_effort(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase)
+}
+
+/// End-only observations cannot establish the settings at an unobserved request start.
+fn request_effort(s: &Session, p: &Value, start: Option<i64>) -> (Option<String>, String) {
+    if let Some(value) = p.get("reasoning_effort").or_else(|| p.get("effort")) {
+        return (normalized_effort(value), "request".into());
+    }
+    start
+        .and_then(|start| {
+            s.effort_history
+                .iter()
+                .rev()
+                .find(|(time, _)| *time <= start)
+        })
+        .map(|(_, effort)| (effort.clone(), "settings".into()))
+        .unwrap_or_default()
 }
 
 /// Chunked sources may deliver settings late; re-evaluate inferred tiers at each observed start.
@@ -2005,11 +2080,14 @@ fn request_usage(s: &mut Session, p: &Value, ts: i64, allow_reprice: bool) {
         refresh_latest_tps(s, matches[0]);
     } else {
         let (tier, tier_source) = usage_tier(s, p, ts);
+        let (reasoning_effort, reasoning_effort_source) = request_effort(s, p, None);
         s.requests.push(ModelRequest {
             id: id.into(),
             model: usage_model(s, p).to_owned(),
             service_tier: tier,
             service_tier_source: tier_source,
+            reasoning_effort,
+            reasoning_effort_source,
             compaction_id: compaction_at(s, ts),
             ended_ms: Some(ts),
             output_tokens: tokens,
@@ -2102,11 +2180,14 @@ fn model_hook(s: &mut Session, p: &Value, ts: i64, name: &str) {
     s.model_boundary_ms = ts;
     if name == "PreModelRequest" {
         s.request_started_ms = Some(ts);
+        let (reasoning_effort, reasoning_effort_source) = request_effort(s, p, Some(ts));
         s.requests.push(ModelRequest {
             id: format!("hook:{ts}"),
             model: s.model.clone(),
             service_tier: request_tier(s, p, ts).0,
             service_tier_source: request_tier(s, p, ts).1,
+            reasoning_effort,
+            reasoning_effort_source,
             compaction_id: compaction_at(s, ts),
             started_ms: Some(ts),
             status: "进行中".into(),
@@ -2130,6 +2211,15 @@ fn model_hook(s: &mut Session, p: &Value, ts: i64, name: &str) {
         .as_ref()
         .map(|r| (r.service_tier.clone(), r.service_tier_source.clone()))
         .unwrap_or_else(|| tier_at(s, start.unwrap_or(ts)));
+    let effort = snapshot
+        .as_ref()
+        .map(|r| {
+            (
+                r.reasoning_effort.clone(),
+                r.reasoning_effort_source.clone(),
+            )
+        })
+        .unwrap_or_else(|| request_effort(s, p, start));
     let mut request = ModelRequest {
         id: format!("hook:{ts}"),
         model: snapshot
@@ -2138,6 +2228,8 @@ fn model_hook(s: &mut Session, p: &Value, ts: i64, name: &str) {
             .unwrap_or_else(|| s.model.clone()),
         service_tier: tier.0,
         service_tier_source: tier.1,
+        reasoning_effort: effort.0,
+        reasoning_effort_source: effort.1,
         compaction_id: snapshot
             .as_ref()
             .and_then(|r| r.compaction_id.clone())
@@ -2987,6 +3079,113 @@ mod tests {
             &json!({"type":"monitor_hook","timestamp_ms":ts,
             "payload":{"turn_id":"one","hook_event_name":name,"status":"completed"}}),
         );
+    }
+
+    fn effort_setting(s: &mut Session, ts: i64, effort: Value) {
+        apply(
+            s,
+            &json!({"type":"event_msg","timestamp_ms":ts,
+                "payload":{"type":"thread_settings_applied",
+                    "thread_settings":{"reasoning_effort":effort}}}),
+        );
+    }
+
+    // Mid-request changes affect the next request in either hook/usage delivery order.
+    #[test]
+    fn effort_switches_keep_request_start_snapshots() {
+        for usage_first in [true, false] {
+            let mut s = Session {
+                id: "chat".into(),
+                ..Session::default()
+            };
+            billing_turn(&mut s, "one", "gpt-6.1-sol", 100);
+            apply(
+                &mut s,
+                &json!({"type":"turn_context","timestamp_ms":900,
+                "payload":{"turn_id":"one","model":"gpt-6.1-sol","effort":"high"}}),
+            );
+            request_event(&mut s, 1000, "PreModelRequest");
+            effort_setting(&mut s, 1100, json!("low"));
+            let usage = priced_record("r1", "one", 1200, 1000, 700, 0, 100);
+            if usage_first {
+                apply(&mut s, &usage);
+            }
+            request_event(&mut s, 1300, "PostModelRequest");
+            if !usage_first {
+                apply(&mut s, &usage);
+            }
+            request_event(&mut s, 1400, "PreModelRequest");
+            effort_setting(&mut s, 1500, Value::Null);
+            request_event(&mut s, 1600, "PostModelRequest");
+            request_event(&mut s, 1700, "PreModelRequest");
+            request_event(&mut s, 1800, "PostModelRequest");
+            let efforts: Vec<_> = s
+                .requests
+                .iter()
+                .map(|r| r.reasoning_effort.as_deref())
+                .collect();
+            assert_eq!(efforts, [Some("high"), Some("low"), None]);
+            assert_eq!(s.requests[0].input_tokens, Some(1000));
+            assert_eq!(s.requests[0].cached_input_tokens, Some(700));
+            assert_eq!(s.requests[0].output_tokens, Some(100));
+            assert_eq!(s.cost.priced_requests, 1);
+        }
+    }
+
+    // Late settings fill the original start, including archived requests after a cache round trip.
+    #[test]
+    fn late_effort_history_uses_start_and_preserves_cost() {
+        let mut s = Session {
+            id: "chat".into(),
+            ..Session::default()
+        };
+        billing_turn(&mut s, "one", "gpt-6.1-sol", 100);
+        request_event(&mut s, 1000, "PreModelRequest");
+        apply(&mut s, &priced_record("r1", "one", 1100, 1000, 700, 0, 100));
+        request_event(&mut s, 1300, "PostModelRequest");
+        let cost = s.cost.total();
+        effort_setting(&mut s, 1200, json!("max"));
+        assert_eq!(s.requests[0].reasoning_effort, None);
+        effort_setting(&mut s, 900, json!("high"));
+        assert_eq!(s.requests[0].reasoning_effort.as_deref(), Some("high"));
+        s = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        billing_turn(&mut s, "two", "gpt-6.1-sol", 2000);
+        effort_setting(&mut s, 950, json!("low"));
+        assert_eq!(
+            s.timeline_history[0].requests[0]
+                .reasoning_effort
+                .as_deref(),
+            Some("low")
+        );
+        assert_eq!(s.cost.priced_requests, 1);
+        assert_eq!(s.cost.total(), cost);
+    }
+
+    // End-only observations stay unknown; explicit request effort outranks later history delivery.
+    #[test]
+    fn unknown_and_explicit_request_effort_are_not_guessed() {
+        let mut s = Session {
+            id: "chat".into(),
+            ..Session::default()
+        };
+        billing_turn(&mut s, "one", "gpt-6.1-sol", 100);
+        effort_setting(&mut s, 900, json!("high"));
+        apply(&mut s, &priced_record("r1", "one", 1000, 1000, 700, 0, 100));
+        apply(
+            &mut s,
+            &json!({"type":"monitor_hook","timestamp_ms":1100,
+            "payload":{"turn_id":"one","hook_event_name":"PreModelRequest",
+                "reasoning_effort":"low"}}),
+        );
+        request_event(&mut s, 1300, "PostModelRequest");
+        effort_setting(&mut s, 1050, json!("max"));
+        assert_eq!(s.requests.len(), 2);
+        assert_eq!(s.requests[0].reasoning_effort, None);
+        assert_eq!(s.requests[1].reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(s.requests[1].reasoning_effort_source, "request");
+        let legacy: ModelRequest =
+            serde_json::from_value(json!({"id":"cached-before-effort"})).unwrap();
+        assert_eq!(legacy.reasoning_effort, None);
     }
 
     // Each request keeps its Standard/Fast snapshot even when the same turn changes settings again.

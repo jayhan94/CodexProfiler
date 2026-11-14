@@ -23,16 +23,28 @@ struct HookInput {
     response_id: Option<String>,
     #[serde(
         default,
-        deserialize_with = "present_tier",
+        deserialize_with = "present_value",
         skip_serializing_if = "Option::is_none"
     )]
     service_tier: Option<Value>,
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    reasoning_effort: Option<Value>,
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    effort: Option<Value>,
     trigger: Option<String>,
     #[serde(default, deserialize_with = "limited_input")]
     tool_input: Option<Value>,
 }
 
-fn present_tier<'de, D: serde::Deserializer<'de>>(
+fn present_value<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<Value>, D::Error> {
     Value::deserialize(deserializer).map(Some)
@@ -185,5 +197,24 @@ mod tests {
             .get("service_tier")
             .unwrap()
             .is_null());
+    }
+
+    // Hooks retain effort only when supplied, including an explicit unknown value.
+    #[test]
+    fn optional_effort_preserves_presence() {
+        let base = json!({"transcript_path":"log","hook_event_name":"PreModelRequest"});
+        let missing: HookInput = serde_json::from_value(base.clone()).unwrap();
+        let missing = serde_json::to_value(missing).unwrap();
+        assert!(missing.get("reasoning_effort").is_none());
+        assert!(missing.get("effort").is_none());
+        for value in [json!("high"), Value::Null] {
+            let mut supplied = base.clone();
+            supplied["reasoning_effort"] = value.clone();
+            let input: HookInput = serde_json::from_value(supplied).unwrap();
+            assert_eq!(
+                serde_json::to_value(input).unwrap()["reasoning_effort"],
+                value
+            );
+        }
     }
 }

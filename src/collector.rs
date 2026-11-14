@@ -63,10 +63,20 @@ struct ThinPayload {
     cwd: Option<String>,
     model: Option<String>,
     #[serde(
-        deserialize_with = "observed_tier",
+        deserialize_with = "observed_string",
         skip_serializing_if = "Option::is_none"
     )]
     service_tier: Option<Option<String>>,
+    #[serde(
+        deserialize_with = "observed_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    effort: Option<Option<String>>,
+    #[serde(
+        deserialize_with = "observed_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    reasoning_effort: Option<Option<String>>,
     trigger: Option<String>,
     settings: Option<ThinSettings>,
     thread_settings: Option<ThinSettings>,
@@ -104,8 +114,8 @@ struct ThinPayload {
     item: Option<ThinItem>,
 }
 
-// Missing tier is unknown; an explicit JSON null is a recorded reset to standard mode.
-fn observed_tier<'de, D: serde::Deserializer<'de>>(
+// Preserve a recorded null separately from a field that was never observed.
+fn observed_string<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<Option<String>>, D::Error> {
     Option::<String>::deserialize(deserializer).map(Some)
@@ -117,7 +127,12 @@ fn observed_tier<'de, D: serde::Deserializer<'de>>(
 struct ThinSettings {
     model: Option<String>,
     #[serde(
-        deserialize_with = "observed_tier",
+        deserialize_with = "observed_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    reasoning_effort: Option<Option<String>>,
+    #[serde(
+        deserialize_with = "observed_string",
         skip_serializing_if = "Option::is_none"
     )]
     service_tier: Option<Option<String>>,
@@ -3016,6 +3031,42 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(explicit["payload"].get("service_tier"), Some(&Value::Null));
+    }
+
+    // Actual effort fields survive reduction without retaining prompts; missing and null differ.
+    #[test]
+    fn reasoning_effort_fields_preserve_observed_presence() {
+        let context = thin_record(
+            br#"{"type":"turn_context","payload":{"effort":"max","prompt":"discard"}}"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(context["payload"]["effort"], "max");
+        assert!(context["payload"].get("prompt").is_none());
+        for effort in [serde_json::json!("high"), Value::Null] {
+            let row = serde_json::json!({"type":"event_msg","payload":{
+                "type":"thread_settings_applied","thread_settings":{
+                    "reasoning_effort":effort,"instructions":"discard"}}});
+            let reduced = thin_record(&serde_json::to_vec(&row).unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                reduced["payload"]["thread_settings"]["reasoning_effort"],
+                effort
+            );
+            assert!(reduced["payload"]["thread_settings"]
+                .get("instructions")
+                .is_none());
+        }
+        let missing = thin_record(br#"{"type":"turn_context","payload":{"model":"gpt-6.1-sol"}}"#)
+            .unwrap()
+            .unwrap();
+        assert!(missing["payload"].get("effort").is_none());
+        assert!(missing["payload"].get("reasoning_effort").is_none());
+        let hook = thin_record(br#"{"type":"monitor_hook","payload":{"reasoning_effort":"low"}}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(hook["payload"]["reasoning_effort"], "low");
     }
     // First-run discovery retains useful chat relations instead of filling the list with guardians.
     #[test]

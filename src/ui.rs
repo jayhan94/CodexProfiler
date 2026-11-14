@@ -241,7 +241,7 @@ impl Monitor {
             receiver: collector::start(source.clone(), db, context.egui_ctx.clone()),
             snapshot: Snapshot::default(),
             selected: None,
-            source,
+            source: source.clone(),
             order: SessionOrder::default(),
             ordered_ids: Vec::new(),
             show_internal: false,
@@ -761,9 +761,10 @@ impl TimelineRow<'_> {
         match self {
             Self::Tool(t) => format!("{}{}", t.name, suffix(t.compaction_id.is_some())),
             Self::Model(r) => format!(
-                "{} · {}{}",
+                "{} · {} · Think {}{}",
                 r.model,
                 tier_name(&r.service_tier),
+                effort_name(r),
                 suffix(r.compaction_id.is_some())
             ),
             Self::Compaction(_) => "上下文压缩".into(),
@@ -1258,8 +1259,19 @@ fn tool_details(ui: &mut egui::Ui, tool: &Tool) {
 }
 
 fn request_details(ui: &mut egui::Ui, r: &ModelRequest) {
-    badge(ui, tier_name(&r.service_tier), theme::PINK_SOFT, theme::INK);
+    ui.horizontal(|ui| {
+        badge(ui, tier_name(&r.service_tier), theme::PINK_SOFT, theme::INK);
+        badge(
+            ui,
+            &format!("Think {}", effort_name(r)),
+            theme::BLUE,
+            theme::INK,
+        );
+    });
     meta_line(ui, "档位来源", &r.service_tier_source);
+    for (label, value) in request_token_rows(r) {
+        meta_line(ui, label, &value);
+    }
     if let Some(id) = &r.compaction_id {
         meta_line(ui, "所属上下文压缩", id);
     }
@@ -1293,6 +1305,30 @@ fn request_details(ui: &mut egui::Ui, r: &ModelRequest) {
             .small()
             .color(theme::MUTED),
     );
+}
+
+fn effort_name(request: &ModelRequest) -> &str {
+    request
+        .reasoning_effort
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("未知")
+}
+
+/// Input is the reported total, including cached tokens; absent counters remain unknown.
+fn request_token_rows(request: &ModelRequest) -> [(&'static str, String); 4] {
+    let count = |tokens: Option<u64>| tokens.map(number).unwrap_or_else(|| "未知".into());
+    let hit_rate = match (request.input_tokens, request.cached_input_tokens) {
+        (Some(0), _) => "—（输入为 0）".into(),
+        (Some(input), Some(cached)) => format!("{:.1}%", cached as f64 * 100.0 / input as f64),
+        _ => "未知".into(),
+    };
+    [
+        ("输入 tokens（含缓存）", count(request.input_tokens)),
+        ("输出 tokens", count(request.output_tokens)),
+        ("缓存命中 tokens", count(request.cached_input_tokens)),
+        ("缓存命中率", hit_rate),
+    ]
 }
 
 fn tier_name(tier: &str) -> &str {
@@ -1512,9 +1548,10 @@ fn compaction_details(ui: &mut egui::Ui, c: &Compaction, scope: TimelineScope<'_
     ui.small("以下子请求费用已计入会话总额；压缩汇总不会再次计费。");
     for r in requests {
         egui::CollapsingHeader::new(format!(
-            "LLM · {} · {}",
+            "LLM · {} · {} · Think {}",
             r.model,
-            tier_name(&r.service_tier)
+            tier_name(&r.service_tier),
+            effort_name(r)
         ))
         .id_salt(("compression_child_request", &c.id, &r.id))
         .show(ui, |ui| request_details(ui, r));
@@ -2294,5 +2331,69 @@ mod tests {
         };
         assert_eq!(request_token_total(&[&zero], |r| r.input_tokens), "0");
         assert!(request_cost_total(&[&zero, &unknown]).contains("部分估算"));
+    }
+
+    // Request details show raw input including cache, measured hit rate and the effort snapshot.
+    #[test]
+    fn request_details_render_effort_and_token_breakdown() {
+        let request = ModelRequest {
+            model: "gpt-6.1-sol".into(),
+            service_tier: "priority".into(),
+            reasoning_effort: Some("high".into()),
+            input_tokens: Some(1000),
+            output_tokens: Some(125),
+            cached_input_tokens: Some(700),
+            ..ModelRequest::default()
+        };
+        let title = TimelineRow::Model(&request).operation_title();
+        assert!(title.contains("Fast · Think high"));
+        let context = egui::Context::default();
+        let output = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| request_details(ui, &request));
+        });
+        let text = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "Think high",
+            "输入 tokens（含缓存）",
+            "1,000",
+            "输出 tokens",
+            "125",
+            "缓存命中 tokens",
+            "700",
+            "缓存命中率",
+            "70.0%",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+    }
+
+    // Missing counters stay unknown and a measured zero input never becomes a zero-percent ratio.
+    #[test]
+    fn request_token_details_distinguish_unknown_zero_and_cache_misses() {
+        let mut request = ModelRequest::default();
+        assert!(TimelineRow::Model(&request)
+            .operation_title()
+            .contains("Think 未知"));
+        assert!(request_token_rows(&request)
+            .iter()
+            .all(|(_, value)| value == "未知"));
+        request.input_tokens = Some(1000);
+        assert_eq!(request_token_rows(&request)[3].1, "未知");
+        request.cached_input_tokens = Some(0);
+        assert_eq!(request_token_rows(&request)[2].1, "0");
+        assert_eq!(request_token_rows(&request)[3].1, "0.0%");
+        request.input_tokens = Some(0);
+        assert_eq!(request_token_rows(&request)[0].1, "0");
+        assert_eq!(request_token_rows(&request)[3].1, "—（输入为 0）");
+        request.input_tokens = None;
+        assert_eq!(request_token_rows(&request)[3].1, "未知");
     }
 }
