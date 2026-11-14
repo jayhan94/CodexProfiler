@@ -448,14 +448,18 @@ pub fn doctor(home: &Path, database: &Path, executable: &Path) -> (Value, bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
             let directory = std::env::temp_dir().join(format!(
-                "profiler 空 格-{}-{}",
+                "profiler 空 格-{}-{}-{}",
                 std::process::id(),
-                nonce()
+                nonce(),
+                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir_all(&directory).unwrap();
             Self(directory)

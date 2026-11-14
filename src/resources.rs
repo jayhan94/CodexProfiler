@@ -1,4 +1,6 @@
-use crate::theme;
+use crate::model::CostMember;
+use crate::process_ownership::{OwnershipTracker, ProcessRef};
+use crate::{resource_tree, theme};
 use eframe::egui::{self, RichText};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -13,8 +15,8 @@ const MAX_TRACKED: usize = 1_000;
 type Identity = (u32, u64);
 
 #[derive(Clone, Default, Serialize)]
-struct Snapshot {
-    rows: Vec<ProcessRow>,
+pub(crate) struct Snapshot {
+    pub(crate) rows: Vec<ProcessRow>,
     cpu_percent: Option<f32>,
     memory_bytes: u64,
     memory_percent: Option<f64>,
@@ -22,23 +24,25 @@ struct Snapshot {
     cpu_process_count: usize,
     memory_process_count: usize,
     logical_cpus: usize,
-    total_memory: u64,
+    pub(crate) total_memory: u64,
     warnings: Vec<String>,
     sample_millis: u128,
 }
 
-#[derive(Clone, Serialize)]
-struct ProcessRow {
-    pid: u32,
-    parent: Option<u32>,
-    start_time: u64,
-    name: String,
-    path: Option<String>,
-    cpu_percent: Option<f32>,
-    memory_bytes: Option<u64>,
-    memory_percent: Option<f64>,
-    scope: &'static str,
-    depth: usize,
+#[derive(Clone, Default, Serialize)]
+pub(crate) struct ProcessRow {
+    pub(crate) pid: u32,
+    pub(crate) parent: Option<u32>,
+    pub(crate) start_time: u64,
+    pub(crate) name: String,
+    pub(crate) path: Option<String>,
+    pub(crate) cpu_percent: Option<f32>,
+    pub(crate) memory_bytes: Option<u64>,
+    pub(crate) memory_percent: Option<f64>,
+    pub(crate) scope: &'static str,
+    pub(crate) depth: usize,
+    pub(crate) thread_id: Option<String>,
+    pub(crate) shared: bool,
 }
 
 struct ProcessInfo {
@@ -72,6 +76,7 @@ pub struct Monitor {
     shared: Arc<Shared>,
     snapshot: Option<Snapshot>,
     selected: Option<Identity>,
+    selected_only: bool,
 }
 
 impl Monitor {
@@ -90,6 +95,7 @@ impl Monitor {
             shared,
             snapshot: None,
             selected: None,
+            selected_only: true,
         }
     }
 
@@ -103,13 +109,27 @@ impl Monitor {
     }
 
     /// Keep the summary fixed and give only the process table a finite scroll area.
-    pub fn show(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        _ctx: &egui::Context,
+        sessions: &[CostMember],
+        selected_session: Option<&str>,
+    ) {
         if let Some(snapshot) = self.shared.latest.lock().unwrap().take() {
             self.snapshot = Some(snapshot);
         }
-        ui.heading("进程资源");
+        ui.horizontal(|ui| {
+            ui.heading("会话资源");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_enabled(
+                    selected_session.is_some(),
+                    egui::Checkbox::new(&mut self.selected_only, "仅当前会话"),
+                );
+            });
+        });
         ui.label(
-            RichText::new("所有 Codex 会话共用的本机进程树，不按聊天分摊；不含 Profiler 自身。")
+            RichText::new("按进程启动时的会话归属统计，父会话包含子会话；共享和未归属资源另列。")
                 .small()
                 .color(theme::MUTED),
         );
@@ -117,7 +137,35 @@ impl Monitor {
             ui.label("正在发现 Codex 进程并采样…");
             return;
         };
-        summary_cards(ui, snapshot);
+        let tree = resource_tree::SessionTree::new(&snapshot.rows, sessions, selected_session);
+        let focused = self.selected_only.then_some(selected_session).flatten();
+        let usage = if focused.is_some() {
+            tree.usage(focused)
+        } else {
+            resource_tree::Usage {
+                cpu_percent: snapshot.cpu_percent,
+                memory_bytes: snapshot.memory_bytes,
+                process_count: snapshot.process_count,
+                cpu_count: snapshot.cpu_process_count,
+                memory_count: snapshot.memory_process_count,
+            }
+        };
+        summary_cards(ui, snapshot, &usage);
+        ui.small(if focused.is_some() {
+            "当前会话及子会话的已归属用量，共享资源未分摊。"
+        } else {
+            "全部 Codex 本机进程用量，不含 Profiler 自身。"
+        });
+        let attributed = snapshot
+            .rows
+            .iter()
+            .filter(|row| row.thread_id.is_some() && !row.shared)
+            .count();
+        let shared = snapshot.rows.iter().filter(|row| row.shared).count();
+        ui.small(format!(
+            "全局明细：已归属 {attributed} · 共享 {shared} · 未归属 {}",
+            snapshot.rows.len().saturating_sub(attributed + shared)
+        ));
         ui.label(
             RichText::new("工作集合计（共享页可能重复计入）")
                 .small()
@@ -132,8 +180,12 @@ impl Monitor {
                 .small()
                 .color(theme::MUTED),
         );
-        for warning in &snapshot.warnings {
-            ui.colored_label(ui.visuals().warn_fg_color, warning);
+        if !snapshot.warnings.is_empty() {
+            egui::CollapsingHeader::new("全局采集提示").show(ui, |ui| {
+                for warning in &snapshot.warnings {
+                    ui.colored_label(ui.visuals().warn_fg_color, warning);
+                }
+            });
         }
         if snapshot.process_count == 0 {
             ui.label("未发现可识别的 Codex 进程。启动 Codex 后会自动刷新。");
@@ -141,7 +193,7 @@ impl Monitor {
         }
         process_details(ui, snapshot, self.selected);
         ui.separator();
-        process_table(ui, snapshot, &mut self.selected);
+        tree.show(ui, snapshot, focused, selected_session, &mut self.selected);
     }
 }
 
@@ -152,23 +204,23 @@ impl Drop for Monitor {
     }
 }
 
-fn summary_cards(ui: &mut egui::Ui, snapshot: &Snapshot) {
+fn summary_cards(ui: &mut egui::Ui, snapshot: &Snapshot, usage: &resource_tree::Usage) {
     ui.columns(3, |columns| {
         let values = [
-            ("CPU · 整机占比", percent32(snapshot.cpu_percent)),
+            ("CPU · 整机占比", percent32(usage.cpu_percent)),
             (
                 "内存 · 工作集合计",
-                if snapshot.process_count > 0 && snapshot.memory_process_count == 0 {
+                if usage.process_count == 0 || usage.memory_count == 0 {
                     "未知".into()
                 } else {
                     format!(
                         "{:.1} MiB · {}",
-                        mib(snapshot.memory_bytes),
-                        percent(snapshot.memory_percent)
+                        mib(usage.memory_bytes),
+                        percent(ratio(Some(usage.memory_bytes), snapshot.total_memory))
                     )
                 },
             ),
-            ("Codex 进程", snapshot.process_count.to_string()),
+            ("进程数", usage.process_count.to_string()),
         ];
         for (column, (title, value)) in columns.iter_mut().zip(values) {
             theme::card(theme::SURFACE).show(column, |ui| {
@@ -215,45 +267,70 @@ fn process_details(ui: &mut egui::Ui, snapshot: &Snapshot, selected: Option<Iden
     }
 }
 
-fn process_table(ui: &mut egui::Ui, snapshot: &Snapshot, selected: &mut Option<Identity>) {
-    egui::ScrollArea::both()
-        .id_salt("resource-process-table")
-        .auto_shrink([false, false])
+/// Session sections share one outer scroll area; process rows retain their local parent tree.
+pub(crate) fn process_rows(
+    ui: &mut egui::Ui,
+    snapshot: &Snapshot,
+    indices: &[usize],
+    selected: &mut Option<Identity>,
+    key: &str,
+) {
+    let owned: HashMap<_, _> = indices
+        .iter()
+        .map(|index| {
+            let row = &snapshot.rows[*index];
+            (row.pid, row)
+        })
+        .collect();
+    egui::Grid::new(("resource-process-grid", key))
+        .striped(true)
+        .num_columns(5)
+        .min_col_width(78.0)
         .show(ui, |ui| {
-            egui::Grid::new("resource-process-grid")
-                .striped(true)
-                .num_columns(5)
-                .min_col_width(78.0)
-                .show(ui, |ui| {
-                    for title in ["进程", "PID", "CPU %", "内存", "内存 %"] {
-                        ui.strong(title);
+            for title in ["进程", "PID", "CPU %", "内存", "内存 %"] {
+                ui.strong(title);
+            }
+            ui.end_row();
+            for index in indices {
+                let row = &snapshot.rows[*index];
+                let identity = (row.pid, row.start_time);
+                ui.horizontal(|ui| {
+                    ui.add_space(local_depth(row, &owned) as f32 * 12.0);
+                    if ui
+                        .selectable_label(*selected == Some(identity), &row.name)
+                        .clicked()
+                    {
+                        *selected = Some(identity);
                     }
-                    ui.end_row();
-                    for row in &snapshot.rows {
-                        let identity = (row.pid, row.start_time);
-                        ui.horizontal(|ui| {
-                            ui.add_space(row.depth.min(12) as f32 * 12.0);
-                            if ui
-                                .selectable_label(*selected == Some(identity), &row.name)
-                                .clicked()
-                            {
-                                *selected = Some(identity);
-                            }
-                            if row.scope == "共享 Codex 沙箱" {
-                                ui.label(RichText::new("共享沙箱").small().color(theme::PINK));
-                            }
-                        });
-                        ui.monospace(row.pid.to_string());
-                        ui.monospace(percent32(row.cpu_percent));
-                        ui.monospace(row.memory_bytes.map_or_else(
-                            || "未知".into(),
-                            |bytes| format!("{:.1} MiB", mib(bytes)),
-                        ));
-                        ui.monospace(percent(row.memory_percent));
-                        ui.end_row();
+                    if row.scope == "共享 Codex 沙箱" {
+                        ui.label(RichText::new("共享沙箱").small().color(theme::PINK));
                     }
                 });
+                ui.monospace(row.pid.to_string());
+                ui.monospace(percent32(row.cpu_percent));
+                ui.monospace(
+                    row.memory_bytes
+                        .map_or_else(|| "未知".into(), |bytes| format!("{:.1} MiB", mib(bytes))),
+                );
+                ui.monospace(percent(row.memory_percent));
+                ui.end_row();
+            }
         });
+}
+
+/// Stop indentation at another session's process boundary or an invalid parent identity.
+fn local_depth(row: &ProcessRow, owned: &HashMap<u32, &ProcessRow>) -> usize {
+    let mut current = row;
+    let mut seen = HashSet::from([row.pid]);
+    let mut depth = 0;
+    while let Some(parent) = current.parent.and_then(|pid| owned.get(&pid)) {
+        if !seen.insert(parent.pid) || parent.start_time > current.start_time || depth >= 12 {
+            break;
+        }
+        depth += 1;
+        current = parent;
+    }
+    depth
 }
 
 fn percent32(value: Option<f32>) -> String {
@@ -311,6 +388,7 @@ struct Sampler {
     tracked: HashSet<Identity>,
     previous: HashSet<Identity>,
     last_sample: Option<Instant>,
+    ownership: OwnershipTracker,
 }
 
 impl Sampler {
@@ -322,10 +400,11 @@ impl Sampler {
             tracked: HashSet::new(),
             previous: HashSet::new(),
             last_sample: None,
+            ownership: OwnershipTracker::default(),
         })
     }
 
-    /// Refresh only CPU, RSS and executable identity; never collect commands or environment secrets.
+    /// Refresh metrics normally; only newly seen Codex tool processes need a transient owner lookup.
     fn collect(&mut self) -> Snapshot {
         let began = Instant::now();
         self.system
@@ -360,10 +439,30 @@ impl Sampler {
             })
             .collect();
         let selected = select_processes(&processes, &self.tracked, std::process::id());
+        let bindings = self.ownership.sample(
+            &selected
+                .iter()
+                .take(MAX_TRACKED)
+                .filter_map(|pid| {
+                    processes.get(pid).map(|process| ProcessRef {
+                        pid: process.pid,
+                        parent: process.parent,
+                        start_time: process.start,
+                        shared: root_kind(process).is_some(),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
         let enough_time = self
             .last_sample
             .is_some_and(|time| time.elapsed() >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
         let mut snapshot = self.snapshot(&processes, &selected, enough_time);
+        for row in &mut snapshot.rows {
+            row.thread_id = bindings.get(&(row.pid, row.start_time)).cloned();
+        }
+        if let Some(error) = self.ownership.last_error() {
+            snapshot.warnings.push(format!("会话归属读取受限：{error}"));
+        }
         // Keep only live identities, so reparenting survives but PID reuse cannot inherit membership.
         self.tracked = selected
             .iter()
@@ -431,6 +530,8 @@ impl Sampler {
                     memory_percent: ratio(memory, total_memory),
                     scope: root_kind(info).unwrap_or("Codex 工具 / 子进程"),
                     depth,
+                    thread_id: None,
+                    shared: root_kind(info).is_some(),
                 });
             }
         }
