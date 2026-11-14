@@ -4,7 +4,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{value::RawValue, Value};
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -14,8 +14,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
-const MAX_SESSIONS: usize = 32;
-const CACHE_VERSION: i64 = 6;
+const MAX_SESSIONS: usize = 96;
+const CACHE_VERSION: i64 = 7;
 const DETAILS_CHARS: usize = 32 * 1024;
 const CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -67,6 +67,10 @@ struct ThinPayload {
     source: Option<Value>,
     agent_role: Option<String>,
     agent_path: Option<String>,
+    agent_nickname: Option<String>,
+    parent_thread_id: Option<String>,
+    forked_from_id: Option<String>,
+    attached_thread: Option<bool>,
     #[serde(deserialize_with = "detail_text")]
     input: Option<String>,
     #[serde(deserialize_with = "detail_text")]
@@ -305,12 +309,12 @@ impl Store {
         {
             // These tables are a reproducible cache; Codex source logs are never changed.
             db.execute_batch(
-                "BEGIN; DELETE FROM sources; DELETE FROM sessions; PRAGMA user_version=6; COMMIT;",
+                "BEGIN; DELETE FROM sources; DELETE FROM sessions; PRAGMA user_version=7; COMMIT;",
             )?;
         }
         let sessions = {
             let mut statement =
-                db.prepare("SELECT id,state FROM sessions ORDER BY last_ms DESC LIMIT 32")?;
+                db.prepare("SELECT id,state FROM sessions ORDER BY last_ms DESC LIMIT 96")?;
             let rows = statement
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             let mut sessions = HashMap::new();
@@ -610,25 +614,59 @@ impl Store {
 
 /// Discovery walks once on startup; ongoing updates arrive from OS file notifications.
 fn recent_files(root: &Path) -> Result<Vec<PathBuf>> {
-    let mut recent = BinaryHeap::new();
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
     for entry in WalkDir::new(root).into_iter() {
         let entry = entry?;
         if is_rollout(entry.path()) && entry.file_type().is_file() {
-            recent.push(std::cmp::Reverse((
-                entry.metadata()?.modified()?,
-                entry.into_path(),
-            )));
-            if recent.len() > MAX_SESSIONS {
-                recent.pop();
+            let mut first = String::new();
+            BufReader::new(File::open(entry.path())?.take(1024 * 1024)).read_line(&mut first)?;
+            if let Ok(meta) = serde_json::from_str::<Value>(&first) {
+                let p = &meta["payload"];
+                let mut session = Session::default();
+                model::apply(
+                    &mut session,
+                    &serde_json::json!({"type":"session_meta","payload":p}),
+                );
+                if session.thread_kind != "internal" {
+                    files.push((
+                        entry.metadata()?.modified()?,
+                        entry.into_path(),
+                        session.id,
+                        session.parent_id,
+                    ));
+                }
             }
         }
     }
-    let mut files: Vec<_> = recent.into_iter().map(|entry| entry.0).collect();
-    files.sort_by_key(|(time, _)| std::cmp::Reverse(*time));
-    Ok(files
+    files.sort_by_key(|(time, _, _, _)| std::cmp::Reverse(*time));
+    let mut chosen = HashSet::new();
+    let mut pending: Vec<_> = files
+        .iter()
+        .take(MAX_SESSIONS)
+        .map(|(_, _, id, _)| id.clone())
+        .collect();
+    // Load missing ancestors before children so attached chats remain reachable in the sidebar.
+    while let Some(id) = pending.pop() {
+        if chosen.insert(id.clone()) {
+            if let Some((_, _, _, parent)) = files.iter().find(|(_, _, own, _)| own == &id) {
+                if !parent.is_empty() && !chosen.contains(parent) {
+                    pending.push(parent.clone());
+                }
+            }
+        }
+    }
+    let mut selected: Vec<_> = files
+        .into_iter()
+        .filter(|(_, _, id, _)| chosen.contains(id))
+        .collect();
+    selected.sort_by_key(|(_, _, _, parent)| !parent.is_empty());
+    Ok(selected
         .into_iter()
         .take(MAX_SESSIONS)
-        .map(|(_, path)| path)
+        .map(|(_, path, _, _)| path)
         .collect())
 }
 
@@ -674,9 +712,12 @@ fn watch_sources(
         },
         notify::Config::default(),
     )?;
-    watcher.watch(root, RecursiveMode::Recursive)?;
+    if root.is_dir() {
+        watcher.watch(root, RecursiveMode::Recursive)?;
+    }
     if let Some(home) = root.parent() {
-        watcher.watch(home, RecursiveMode::NonRecursive)?;
+        let existing = home.ancestors().find(|path| path.is_dir()).unwrap_or(home);
+        watcher.watch(existing, RecursiveMode::NonRecursive)?;
     }
     if hooks_dir.exists() {
         watcher.watch(hooks_dir, RecursiveMode::NonRecursive)?;
@@ -708,9 +749,17 @@ fn run(
     {
         enqueue(path, &mut queue, &mut queued);
     }
+    let mut sessions_watched = root.is_dir();
     let mut last_publish = Instant::now();
     let mut dirty = true;
     loop {
+        if !sessions_watched && root.is_dir() {
+            watcher.watch(&root, RecursiveMode::Recursive)?;
+            sessions_watched = true;
+            for path in recent_files(&root)? {
+                enqueue(path, &mut queue, &mut queued);
+            }
+        }
         if let Some(path) = queue.pop_front() {
             queued.remove(&path);
             let result = if path == index {
@@ -1156,5 +1205,38 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(explicit["payload"].get("service_tier"), Some(&Value::Null));
+    }
+    // First-run discovery retains useful chat relations instead of filling the list with guardians.
+    #[test]
+    fn discovery_retains_attached_parent_and_filters_system_tasks() {
+        let dir = fixture("relationships");
+        for (name, payload) in [
+            (
+                "parent",
+                serde_json::json!({"id":"parent","source":"vscode"}),
+            ),
+            (
+                "side",
+                serde_json::json!({"id":"side","source":"vscode","attached_thread":true,"forked_from_id":"parent"}),
+            ),
+            (
+                "guardian",
+                serde_json::json!({"id":"guardian","source":{"subagent":{"other":"guardian"}}}),
+            ),
+        ] {
+            fs::write(
+                dir.join(format!("rollout-{name}.jsonl")),
+                format!(
+                    "{}\n",
+                    serde_json::json!({"type":"session_meta","payload":payload})
+                ),
+            )
+            .unwrap();
+        }
+        let files = recent_files(&dir).unwrap();
+        assert!(files.contains(&dir.join("rollout-parent.jsonl")));
+        assert!(files.contains(&dir.join("rollout-side.jsonl")));
+        assert!(!files.contains(&dir.join("rollout-guardian.jsonl")));
+        fs::remove_dir_all(dir).unwrap();
     }
 }

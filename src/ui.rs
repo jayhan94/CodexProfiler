@@ -1,7 +1,8 @@
 use crate::collector;
 use crate::model::{now_ms, Compaction, ModelRequest, Session, Snapshot, Tool};
-use crate::{pricing, theme};
+use crate::{pricing, resources, theme};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
@@ -20,26 +21,194 @@ struct SessionOrder {
     active: Vec<String>,
 }
 
+struct OrderActivity<'a> {
+    session: &'a Session,
+    active: bool,
+    last_ms: i64,
+}
+
 // Activity updates never reorder members of the active group; idle chats use recency.
 impl SessionOrder {
     fn arrange(&mut self, sessions: &[Session], now: i64) -> Vec<String> {
+        let activity = ordering_activity(sessions, now);
         self.active
-            .retain(|id| sessions.iter().any(|s| &s.id == id && is_active(s, now)));
-        let mut newly_active: Vec<_> = sessions
+            .retain(|id| activity.iter().any(|s| &s.session.id == id && s.active));
+        let mut newly_active: Vec<_> = activity
             .iter()
-            .filter(|s| is_active(s, now) && !self.active.contains(&s.id))
+            .filter(|s| s.active && !self.active.contains(&s.session.id))
             .collect();
-        newly_active.sort_by(|a, b| b.last_ms.cmp(&a.last_ms).then(a.id.cmp(&b.id)));
+        newly_active.sort_by(|a, b| {
+            b.last_ms
+                .cmp(&a.last_ms)
+                .then(a.session.id.cmp(&b.session.id))
+        });
         self.active
-            .extend(newly_active.into_iter().map(|s| s.id.clone()));
-        let mut idle: Vec<_> = sessions.iter().filter(|s| !is_active(s, now)).collect();
-        idle.sort_by(|a, b| b.last_ms.cmp(&a.last_ms).then(a.id.cmp(&b.id)));
+            .extend(newly_active.into_iter().map(|s| s.session.id.clone()));
+        let mut idle: Vec<_> = activity.iter().filter(|s| !s.active).collect();
+        idle.sort_by(|a, b| {
+            b.last_ms
+                .cmp(&a.last_ms)
+                .then(a.session.id.cmp(&b.session.id))
+        });
         self.active
             .iter()
             .cloned()
-            .chain(idle.into_iter().map(|s| s.id.clone()))
+            .chain(idle.into_iter().map(|s| s.session.id.clone()))
             .collect()
     }
+}
+
+/// A running child keeps its ancestors active without changing their measured metrics.
+fn ordering_activity(sessions: &[Session], now: i64) -> Vec<OrderActivity<'_>> {
+    let indices: HashMap<_, _> = sessions
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.id.as_str(), i))
+        .collect();
+    let mut activity: Vec<_> = sessions
+        .iter()
+        .map(|session| OrderActivity {
+            session,
+            active: is_active(session, now),
+            last_ms: session.last_ms,
+        })
+        .collect();
+    for session in sessions {
+        let mut current = session;
+        let mut visited = HashSet::new();
+        while child_label(current).is_some()
+            && visited.len() < 32
+            && visited.insert(current.id.as_str())
+        {
+            let Some(&index) = indices.get(current.parent_id.as_str()) else {
+                break;
+            };
+            activity[index].active |= is_active(session, now);
+            activity[index].last_ms = activity[index].last_ms.max(session.last_ms);
+            current = &sessions[index];
+        }
+    }
+    activity
+}
+
+fn child_label(session: &Session) -> Option<&'static str> {
+    match session.thread_kind.as_str() {
+        "subagent" => Some("子智能体"),
+        "side_chat" => Some("侧边聊天"),
+        _ => None,
+    }
+}
+
+struct SessionTree<'a> {
+    sessions: HashMap<&'a str, &'a Session>,
+    roots: Vec<&'a str>,
+    children: HashMap<&'a str, Vec<&'a str>>,
+    orphans: Vec<&'a str>,
+}
+
+impl<'a> SessionTree<'a> {
+    fn new(sessions: &'a [Session], ordered: &'a [String], show_internal: bool) -> Self {
+        let sessions: HashMap<_, _> = sessions
+            .iter()
+            .filter(|s| show_internal || s.thread_kind != "internal")
+            .map(|s| (s.id.as_str(), s))
+            .collect();
+        let mut tree = Self {
+            sessions,
+            roots: Vec::new(),
+            children: HashMap::new(),
+            orphans: Vec::new(),
+        };
+        for id in ordered {
+            let Some(&session) = tree.sessions.get(id.as_str()) else {
+                continue;
+            };
+            if child_label(session).is_none() {
+                tree.roots.push(id);
+            } else {
+                tree.children
+                    .entry(&session.parent_id)
+                    .or_default()
+                    .push(id);
+                if tree.root_for(session).is_none() {
+                    tree.orphans.push(id);
+                }
+            }
+        }
+        tree
+    }
+
+    /// Missing ancestors and cycles remain explicit, never promoted to ordinary root chats.
+    fn root_for(&self, mut session: &'a Session) -> Option<&'a str> {
+        let mut visited = HashSet::new();
+        while child_label(session).is_some() {
+            if visited.len() >= 32 || !visited.insert(session.id.as_str()) {
+                return None;
+            }
+            session = self.sessions.get(session.parent_id.as_str())?;
+        }
+        Some(session.id.as_str())
+    }
+
+    fn show(&self, ui: &mut egui::Ui, selected: &mut Option<String>) {
+        let mut shown = HashSet::new();
+        for id in &self.roots {
+            self.show_branch(ui, id, selected, &mut shown, 0);
+        }
+        if !self.orphans.is_empty() {
+            egui::CollapsingHeader::new(format!("父会话未加载 · {}", self.orphans.len()))
+                .id_salt("orphan_sessions")
+                .default_open(false)
+                .show(ui, |ui| {
+                    for id in &self.orphans {
+                        self.show_branch(ui, id, selected, &mut shown, 0);
+                    }
+                });
+        }
+    }
+
+    fn show_branch(
+        &self,
+        ui: &mut egui::Ui,
+        id: &'a str,
+        selected: &mut Option<String>,
+        shown: &mut HashSet<&'a str>,
+        depth: usize,
+    ) {
+        if depth >= 32 || !shown.insert(id) {
+            return;
+        }
+        let Some(session) = self.sessions.get(id) else {
+            return;
+        };
+        ui.push_id(("session_branch", id), |ui| {
+            if session_card(ui, session, selected.as_deref() == Some(id)).clicked() {
+                *selected = Some(id.to_owned());
+            }
+            if let Some(children) = self.children.get(id) {
+                egui::CollapsingHeader::new(
+                    RichText::new(format!("子会话 {}", children.len()))
+                        .size(10.5)
+                        .color(theme::MUTED),
+                )
+                .id_salt(("child_sessions", id))
+                .default_open(false)
+                .show(ui, |ui| {
+                    for child in children {
+                        self.show_branch(ui, child, selected, shown, depth + 1);
+                    }
+                });
+            }
+            ui.add_space(8.0);
+        });
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Page {
+    #[default]
+    Sessions,
+    Processes,
 }
 
 fn is_active(session: &Session, _now: i64) -> bool {
@@ -55,6 +224,8 @@ pub struct Monitor {
     ordered_ids: Vec<String>,
     show_internal: bool,
     filter: Filter,
+    page: Page,
+    resources: resources::Monitor,
 }
 
 impl Monitor {
@@ -70,6 +241,8 @@ impl Monitor {
             ordered_ids: Vec::new(),
             show_internal: false,
             filter: Filter::default(),
+            page: Page::default(),
+            resources: resources::Monitor::new(context.egui_ctx.clone()),
         }
     }
 
@@ -79,7 +252,7 @@ impl Monitor {
             self.snapshot = snapshot;
         }
         self.ordered_ids = self.order.arrange(&self.snapshot.sessions, now_ms());
-        let visible = |s: &&Session| self.show_internal || !s.is_internal;
+        let visible = |s: &&Session| self.show_internal || s.thread_kind != "internal";
         let exists = self
             .snapshot
             .sessions
@@ -91,10 +264,11 @@ impl Monitor {
                 .ordered_ids
                 .iter()
                 .find(|id| {
-                    self.snapshot
-                        .sessions
-                        .iter()
-                        .any(|s| &s.id == *id && (self.show_internal || !s.is_internal))
+                    self.snapshot.sessions.iter().any(|s| {
+                        &s.id == *id
+                            && child_label(s).is_none()
+                            && (self.show_internal || s.thread_kind != "internal")
+                    })
                 })
                 .cloned();
         }
@@ -116,7 +290,7 @@ impl Monitor {
                         .snapshot
                         .sessions
                         .iter()
-                        .filter(|s| self.show_internal || !s.is_internal)
+                        .filter(|s| self.show_internal || s.thread_kind != "internal")
                         .count();
                     badge(ui, &count.to_string(), theme::SURFACE, theme::MUTED);
                 });
@@ -126,19 +300,12 @@ impl Monitor {
                 egui::ScrollArea::vertical()
                     .id_salt("sessions_scroll")
                     .show(ui, |ui| {
-                        for id in &self.ordered_ids {
-                            let Some(s) = self.snapshot.sessions.iter().find(|s| &s.id == id)
-                            else {
-                                continue;
-                            };
-                            if !self.show_internal && s.is_internal {
-                                continue;
-                            }
-                            if session_card(ui, s, self.selected.as_ref() == Some(id)).clicked() {
-                                self.selected = Some(id.clone());
-                            }
-                            ui.add_space(8.0);
-                        }
+                        SessionTree::new(
+                            &self.snapshot.sessions,
+                            &self.ordered_ids,
+                            self.show_internal,
+                        )
+                        .show(ui, &mut self.selected);
                     });
             });
     }
@@ -171,6 +338,16 @@ impl eframe::App for Monitor {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG).inner_margin(22))
             .show(ctx, |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.selectable_value(&mut self.page, Page::Processes, "进程资源");
+                    ui.selectable_value(&mut self.page, Page::Sessions, "会话分析");
+                });
+                ui.add_space(12.0);
+                self.resources.set_visible(self.page == Page::Processes);
+                if self.page == Page::Processes {
+                    self.resources.show(ui, ctx);
+                    return;
+                }
                 if let Some(error) = &self.snapshot.error {
                     theme::card(theme::YELLOW_SOFT).show(ui, |ui| {
                         ui.label(RichText::new(error).color(theme::INK).small());
@@ -229,8 +406,10 @@ fn brand(ui: &mut egui::Ui) {
 
 /// Fixed-height cards stop titles and activity updates from shifting the session list.
 fn session_card(ui: &mut egui::Ui, s: &Session, selected: bool) -> egui::Response {
+    let child = child_label(s);
+    let height = if child.is_some() { 104.0 } else { 82.0 };
     let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 82.0), Sense::click());
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
     let fill = if selected {
         theme::PINK_SOFT
     } else if response.hovered() {
@@ -250,6 +429,30 @@ fn session_card(ui: &mut egui::Ui, s: &Session, selected: bool) -> egui::Respons
         let rail = Rect::from_min_size(rect.min + Vec2::new(0.0, 21.0), Vec2::new(3.0, 40.0));
         ui.painter().rect_filled(rail, 2, theme::PINK);
     }
+    if let Some(label) = child {
+        let fill = if s.thread_kind == "subagent" {
+            theme::PINK_SOFT
+        } else {
+            theme::YELLOW_SOFT
+        };
+        let tag = if s.agent_name.is_empty() {
+            label.to_owned()
+        } else {
+            format!("{label} · {}", s.agent_name)
+        };
+        let tag_rect = Rect::from_min_size(
+            rect.min + Vec2::new(13.0, 9.0),
+            Vec2::new(rect.width() - 26.0, 18.0),
+        );
+        ui.painter().rect_filled(tag_rect, 2, fill);
+        ui.painter().with_clip_rect(tag_rect).text(
+            tag_rect.left_center() + Vec2::new(5.0, 0.0),
+            Align2::LEFT_CENTER,
+            tag,
+            FontId::proportional(9.5),
+            theme::INK,
+        );
+    }
     let title = display_title(s);
     let mut job = egui::text::LayoutJob::simple(
         title.clone(),
@@ -259,14 +462,17 @@ fn session_card(ui: &mut egui::Ui, s: &Session, selected: bool) -> egui::Respons
     );
     job.wrap.max_rows = 2;
     let galley = ui.fonts(|fonts| fonts.layout_job(job));
-    ui.painter()
-        .galley(rect.min + Vec2::new(13.0, 11.0), galley, theme::INK);
+    ui.painter().galley(
+        rect.min + Vec2::new(13.0, if child.is_some() { 33.0 } else { 11.0 }),
+        galley,
+        theme::INK,
+    );
     let active = is_active(s, now_ms());
     let color = if active { theme::PINK } else { theme::MUTED };
     ui.painter()
-        .circle_filled(rect.min + Vec2::new(16.0, 64.0), 3.0, color);
+        .circle_filled(rect.min + Vec2::new(16.0, height - 18.0), 3.0, color);
     ui.painter().text(
-        rect.min + Vec2::new(26.0, 64.0),
+        rect.min + Vec2::new(26.0, height - 18.0),
         Align2::LEFT_CENTER,
         short_phase(s),
         FontId::proportional(10.5),
@@ -444,27 +650,50 @@ impl TimelineRow<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
 struct Columns {
-    time: f32,
-    kind: f32,
-    name: f32,
-    status: f32,
-    elapsed: f32,
-    output: f32,
+    cells: [Rect; 6],
 }
 
 impl Columns {
+    /// Only the operation column flexes; every text cell clips to its own track.
     fn new(rect: Rect) -> Self {
-        let x = rect.left();
+        let edges = [
+            rect.left() + 21.0,
+            rect.left() + 97.0,
+            rect.left() + 153.0,
+            rect.right() - 226.0,
+            rect.right() - 140.0,
+            rect.right() - 70.0,
+            rect.right(),
+        ];
         Self {
-            time: x + 21.0,
-            kind: x + 97.0,
-            name: x + 153.0,
-            status: rect.right() - 210.0,
-            elapsed: rect.right() - 124.0,
-            output: rect.right() - 65.0,
+            cells: std::array::from_fn(|i| {
+                Rect::from_min_max(
+                    Pos2::new(edges[i], rect.top()),
+                    Pos2::new(edges[i + 1], rect.bottom()),
+                )
+            }),
         }
     }
+
+    /// Header and every row reuse the same horizontal bounds, including frame padding.
+    fn at_row(self, rect: Rect) -> [Rect; 6] {
+        self.cells.map(|cell| {
+            Rect::from_min_max(
+                Pos2::new(cell.left(), rect.top()),
+                Pos2::new(cell.right(), rect.bottom()),
+            )
+        })
+    }
+}
+
+fn timeline_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(theme::SURFACE)
+        .stroke(Stroke::new(1.0_f32, theme::BORDER))
+        .corner_radius(2)
+        .inner_margin(4)
 }
 
 /// The timeline keeps column geometry identical for models and tools, regardless of title length.
@@ -476,7 +705,7 @@ fn render_timeline(ui: &mut egui::Ui, s: &Session, filter: &mut Filter) {
         });
     });
     ui.add_space(7.0);
-    timeline_heading(ui);
+    let columns = timeline_heading(ui);
     ui.add_space(5.0);
     let mut rows = Vec::new();
     if matches!(*filter, Filter::All | Filter::Tools) {
@@ -494,7 +723,7 @@ fn render_timeline(ui: &mut egui::Ui, s: &Session, filter: &mut Filter) {
         ui.label(RichText::new("当前筛选暂无记录").color(theme::MUTED));
     }
     for row in rows.into_iter().take(300) {
-        ui.push_id((&s.id, row.key()), |ui| timeline_card(ui, row, s));
+        ui.push_id((&s.id, row.key()), |ui| timeline_card(ui, row, s, columns));
         ui.add_space(5.0);
     }
 }
@@ -531,130 +760,116 @@ fn filter_buttons(ui: &mut egui::Ui, filter: &mut Filter) {
     }
 }
 
-fn timeline_heading(ui: &mut egui::Ui) {
+fn timeline_heading(ui: &mut egui::Ui) -> Columns {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
-    let cols = Columns::new(rect);
-    for (x, title) in [
-        (cols.time, "时间"),
-        (cols.kind, "类型"),
-        (cols.name, "操作"),
-        (cols.status, "状态"),
-        (cols.elapsed, "耗时"),
-        (cols.output, "输出"),
-    ] {
-        ui.painter().text(
-            Pos2::new(x, rect.center().y),
-            Align2::LEFT_CENTER,
+    let cols = Columns::new(rect - timeline_frame().total_margin());
+    for (i, title) in ["时间", "类型", "操作", "状态", "耗时", "输出"]
+        .into_iter()
+        .enumerate()
+    {
+        timeline_text(
+            ui.painter(),
+            cols.cells[i],
+            if i == 1 {
+                Align2::CENTER_CENTER
+            } else {
+                Align2::LEFT_CENTER
+            },
             title,
             FontId::proportional(10.0),
             theme::MUTED,
         );
     }
+    cols
 }
 
-fn timeline_card(ui: &mut egui::Ui, row: TimelineRow<'_>, session: &Session) {
-    egui::Frame::new()
-        .fill(theme::SURFACE)
-        .stroke(Stroke::new(1.0_f32, theme::BORDER))
-        .corner_radius(2)
-        .inner_margin(4)
-        .show(ui, |ui| {
-            let id = ui.make_persistent_id(row.key());
-            let mut open = egui::collapsing_header::CollapsingState::load_with_default_open(
-                ui.ctx(),
-                id,
-                false,
-            );
-            let (rect, response) =
-                ui.allocate_exact_size(Vec2::new(ui.available_width(), 42.0), Sense::click());
-            paint_timeline_row(ui, rect, row, session.ended_ms, open.is_open());
-            if response.clicked() {
-                open.toggle(ui);
+fn timeline_card(ui: &mut egui::Ui, row: TimelineRow<'_>, session: &Session, columns: Columns) {
+    timeline_frame().show(ui, |ui| {
+        let id = ui.make_persistent_id(row.key());
+        let mut open =
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+        let (rect, response) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 42.0), Sense::click());
+        paint_timeline_row(ui, rect, columns, row, session.ended_ms, open.is_open());
+        if response.clicked() {
+            open.toggle(ui);
+        }
+        response.on_hover_text("点击展开详情");
+        open.show_body_unindented(ui, |ui| {
+            ui.add_space(6.0);
+            match row {
+                TimelineRow::Tool(t) => tool_details(ui, t),
+                TimelineRow::Model(r) => request_details(ui, r),
+                TimelineRow::Compaction(c) => compaction_details(ui, c, session),
             }
-            response.on_hover_text("点击展开详情");
-            open.show_body_unindented(ui, |ui| {
-                ui.add_space(6.0);
-                match row {
-                    TimelineRow::Tool(t) => tool_details(ui, t),
-                    TimelineRow::Model(r) => request_details(ui, r),
-                    TimelineRow::Compaction(c) => compaction_details(ui, c, session),
-                }
-            });
         });
+    });
 }
 
 fn paint_timeline_row(
     ui: &egui::Ui,
     rect: Rect,
+    columns: Columns,
     row: TimelineRow<'_>,
     task_end: Option<i64>,
     open: bool,
 ) {
-    let c = Columns::new(rect);
+    let cells = columns.at_row(rect);
     let painter = ui.painter();
-    let center = rect.center().y;
     let arrow = if open { "−" } else { "+" };
     painter.text(
-        Pos2::new(rect.left() + 7.0, center),
+        Pos2::new(rect.left() + 7.0, rect.center().y),
         Align2::LEFT_CENTER,
         arrow,
         FontId::monospace(12.0),
         theme::MUTED,
     );
     let (kind, title, status, elapsed, output, fill) = row_summary(row, task_end);
-    painter.text(
-        Pos2::new(c.time, center),
+    timeline_text(
+        painter,
+        cells[0],
         Align2::LEFT_CENTER,
-        clock_short(Some(row.time())),
+        &clock_short(Some(row.time())),
         FontId::monospace(10.0),
         theme::MUTED,
     );
-    let badge_rect =
-        Rect::from_center_size(Pos2::new(c.kind + 20.0, center), Vec2::new(40.0, 21.0));
+    let badge_rect = Rect::from_center_size(cells[1].center(), Vec2::new(40.0, 21.0));
     painter.rect_filled(badge_rect, 2, fill);
-    painter.text(
-        badge_rect.center(),
+    timeline_text(
+        painter,
+        cells[1],
         Align2::CENTER_CENTER,
         kind,
         FontId::monospace(10.0),
         theme::INK,
     );
-    let name_rect = Rect::from_min_max(
-        Pos2::new(c.name, rect.top()),
-        Pos2::new(c.status - 10.0, rect.bottom()),
-    );
-    painter.with_clip_rect(name_rect).text(
-        Pos2::new(c.name, center),
-        Align2::LEFT_CENTER,
-        title,
-        FontId::proportional(11.5),
-        theme::INK,
-    );
-    let status_rect = Rect::from_min_max(
-        Pos2::new(c.status, rect.top()),
-        Pos2::new(c.elapsed - 6.0, rect.bottom()),
-    );
-    painter.with_clip_rect(status_rect).text(
-        Pos2::new(c.status, center),
-        Align2::LEFT_CENTER,
-        status,
-        FontId::proportional(10.5),
-        theme::MUTED,
-    );
-    painter.text(
-        Pos2::new(c.elapsed, center),
-        Align2::LEFT_CENTER,
-        elapsed,
-        FontId::monospace(10.5),
-        theme::INK,
-    );
-    painter.text(
-        Pos2::new(c.output, center),
-        Align2::LEFT_CENTER,
-        output,
-        FontId::monospace(10.5),
-        theme::INK,
-    );
+    for (i, text, font, color) in [
+        (2, title, FontId::proportional(11.5), theme::INK),
+        (3, status, FontId::proportional(10.5), theme::MUTED),
+        (4, elapsed, FontId::monospace(10.5), theme::INK),
+        (5, output, FontId::monospace(10.5), theme::INK),
+    ] {
+        timeline_text(painter, cells[i], Align2::LEFT_CENTER, &text, font, color);
+    }
+}
+
+/// Each cell keeps long values from painting over the next column in narrow windows.
+fn timeline_text(
+    painter: &egui::Painter,
+    cell: Rect,
+    align: Align2,
+    text: &str,
+    font: FontId,
+    color: Color32,
+) {
+    let anchor = if align == Align2::CENTER_CENTER {
+        cell.center()
+    } else {
+        cell.left_center()
+    };
+    painter
+        .with_clip_rect(painter.clip_rect().intersect(cell))
+        .text(anchor, align, text, font, color);
 }
 
 fn row_summary(
@@ -1097,6 +1312,40 @@ fn shortened(value: &str, limit: usize) -> String {
 mod tests {
     use super::*;
 
+    // Narrow and wide layouts must align the heading with the frame's actual row content.
+    #[test]
+    fn timeline_columns_match_framed_rows_at_two_widths() {
+        for width in [420.0, 920.0] {
+            let context = egui::Context::default();
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 300.0))),
+                ..Default::default()
+            };
+            let _ = context.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let heading = timeline_heading(ui);
+                    timeline_frame().show(ui, |ui| {
+                        let (row, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 42.0),
+                            Sense::hover(),
+                        );
+                        let actual = Columns::new(row);
+                        for (header, cell) in heading.cells.into_iter().zip(actual.cells) {
+                            assert!((header.left() - cell.left()).abs() < 0.01);
+                            assert!((header.right() - cell.right()).abs() < 0.01);
+                            assert!(cell.width() > 0.0);
+                        }
+                        let cells = heading.at_row(row);
+                        assert_eq!(cells[1].center().x, actual.cells[1].center().x);
+                        for pair in cells.windows(2) {
+                            assert!(pair[0].right() <= pair[1].left());
+                        }
+                    });
+                });
+            });
+        }
+    }
+
     fn session(id: &str, time: i64, active: bool) -> Session {
         Session {
             id: id.into(),
@@ -1104,6 +1353,81 @@ mod tests {
             started_ms: Some(1),
             ended_ms: if active { None } else { Some(time) },
             ..Session::default()
+        }
+    }
+
+    fn child(id: &str, parent: &str, time: i64, active: bool, kind: &str) -> Session {
+        Session {
+            parent_id: parent.into(),
+            thread_kind: kind.into(),
+            ..session(id, time, active)
+        }
+    }
+
+    // Active descendants promote parents, while updates preserve root and child ordering.
+    #[test]
+    fn child_activity_preserves_root_and_sibling_order() {
+        let mut sessions = vec![
+            session("a", 1, false),
+            session("b", 2, false),
+            child("a-child-1", "a", 100, true, "subagent"),
+            child("a-child-2", "a", 90, true, "side_chat"),
+            child("b-child", "b", 80, true, "subagent"),
+        ];
+        let mut order = SessionOrder::default();
+        let ids = order.arrange(&sessions, 100);
+        let tree = SessionTree::new(&sessions, &ids, false);
+        assert_eq!(tree.roots, ["a", "b"]);
+        assert_eq!(tree.children["a"], ["a-child-1", "a-child-2"]);
+        sessions[3].last_ms = 200;
+        sessions[4].last_ms = 300;
+        let ids = order.arrange(&sessions, 300);
+        let tree = SessionTree::new(&sessions, &ids, false);
+        assert_eq!(tree.roots, ["a", "b"]);
+        assert_eq!(tree.children["a"], ["a-child-1", "a-child-2"]);
+        assert!(sessions[0].ended_ms.is_some());
+    }
+
+    // Both child types are nested and labeled; an ordinary fork remains a root chat.
+    #[test]
+    fn tree_distinguishes_children_forks_and_missing_parents() {
+        let sessions = vec![
+            session("parent", 1, false),
+            child("agent", "parent", 2, true, "subagent"),
+            child("side", "parent", 3, true, "side_chat"),
+            child("fork", "parent", 4, false, "conversation"),
+            child("orphan", "missing", 5, true, "subagent"),
+        ];
+        let ids: Vec<_> = sessions.iter().map(|s| s.id.clone()).collect();
+        let tree = SessionTree::new(&sessions, &ids, false);
+        assert_eq!(tree.roots, ["parent", "fork"]);
+        assert_eq!(tree.children["parent"], ["agent", "side"]);
+        assert_eq!(tree.orphans, ["orphan"]);
+        assert_eq!(child_label(&sessions[1]), Some("子智能体"));
+        assert_eq!(child_label(&sessions[2]), Some("侧边聊天"));
+    }
+
+    // Default-collapsed groups hide children without replacing parent or child selection.
+    #[test]
+    fn collapsed_tree_preserves_selection() {
+        let sessions = vec![
+            session("parent", 1, false),
+            child("child", "parent", 2, true, "subagent"),
+        ];
+        let ids: Vec<_> = sessions.iter().map(|s| s.id.clone()).collect();
+        let tree = SessionTree::new(&sessions, &ids, false);
+        for selected_id in ["parent", "child"] {
+            let context = egui::Context::default();
+            let mut selected = Some(selected_id.to_owned());
+            let _ = context.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut shown = HashSet::new();
+                    tree.show_branch(ui, "parent", &mut selected, &mut shown, 0);
+                    assert!(shown.contains("parent"));
+                    assert!(!shown.contains("child"));
+                });
+            });
+            assert_eq!(selected.as_deref(), Some(selected_id));
         }
     }
 

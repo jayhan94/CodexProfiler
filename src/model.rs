@@ -17,6 +17,8 @@ pub struct Session {
     pub cwd: String,
     pub is_internal: bool,
     pub parent_id: String,
+    pub thread_kind: String,
+    pub agent_name: String,
     pub model: String,
     #[serde(default = "standard_tier")]
     pub service_tier: String,
@@ -975,18 +977,60 @@ fn metadata(s: &mut Session, p: &Value) {
     s.id = text(p, "id");
     s.cwd = text(p, "cwd");
     let source = &p["source"];
-    let parent = source
-        .pointer("/subagent/parent_thread_id")
-        .or_else(|| source.pointer("/subagent/thread_spawn/parent_thread_id"));
-    if let Some(id) = parent.and_then(Value::as_str) {
-        s.parent_id = id.into();
-    }
     let origin = source.to_string().to_lowercase();
     let role = text(p, "agent_role").to_lowercase();
-    s.is_internal |= origin.contains("subagent")
-        || origin.contains("guardian")
-        || role.contains("review")
-        || !s.parent_id.is_empty();
+    let parent = p
+        .get("parent_thread_id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            source
+                .pointer("/subagent/parent_thread_id")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            source
+                .pointer("/subagent/thread_spawn/parent_thread_id")
+                .and_then(Value::as_str)
+        });
+    if let Some(parent) = parent {
+        s.parent_id = parent.into();
+    }
+    // Attached chats have an explicit flag. A regular fork alone is not a sidebar chat.
+    let attached = p["attached_thread"].as_bool() == Some(true);
+    if attached {
+        if let Some(parent) = p["forked_from_id"].as_str() {
+            s.parent_id = parent.into();
+        }
+    }
+    s.thread_kind = if origin.contains("guardian") || role.contains("review") {
+        "internal"
+    } else if source.pointer("/subagent/thread_spawn").is_some()
+        || (origin.contains("subagent") && !s.parent_id.is_empty())
+    {
+        "subagent"
+    } else if attached {
+        "side_chat"
+    } else {
+        "conversation"
+    }
+    .into();
+    s.is_internal = matches!(s.thread_kind.as_str(), "internal" | "subagent");
+    let nickname = p["agent_nickname"].as_str().or_else(|| {
+        source
+            .pointer("/subagent/thread_spawn/agent_nickname")
+            .and_then(Value::as_str)
+    });
+    let path = p["agent_path"].as_str().or_else(|| {
+        source
+            .pointer("/subagent/thread_spawn/agent_path")
+            .and_then(Value::as_str)
+    });
+    s.agent_name = match (nickname, path.and_then(|v| v.rsplit('/').next())) {
+        (Some(name), Some(task)) => format!("{name} · {task}"),
+        (Some(name), None) => name.into(),
+        (None, Some(task)) => task.into(),
+        _ => String::new(),
+    };
 }
 
 fn genuine_prompt(value: &str) -> bool {
@@ -2022,5 +2066,35 @@ mod tests {
         request_event(&mut s, 2000, "PostModelRequest");
         assert!((s.cost.total() - 0.003).abs() < 1e-10);
         assert_eq!(s.requests[0].service_tier, "default");
+    }
+    // Only explicit attachment creates a sidebar relation; a normal fork stays independent.
+    #[test]
+    fn attached_chat_and_agent_have_distinct_relationships() {
+        let mut side = Session::default();
+        apply(
+            &mut side,
+            &json!({"type":"session_meta","payload":{
+            "id":"side","source":"vscode","attached_thread":true,"forked_from_id":"parent"}}),
+        );
+        assert_eq!(side.thread_kind, "side_chat");
+        assert_eq!(side.parent_id, "parent");
+        let mut fork = Session::default();
+        apply(
+            &mut fork,
+            &json!({"type":"session_meta","payload":{
+            "id":"fork","source":"vscode","attached_thread":false,"forked_from_id":"parent"}}),
+        );
+        assert_eq!(fork.thread_kind, "conversation");
+        assert!(fork.parent_id.is_empty());
+        let mut agent = Session::default();
+        apply(
+            &mut agent,
+            &json!({"type":"session_meta","payload":{
+            "id":"agent","parent_thread_id":"parent","agent_nickname":"Helper",
+            "source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}}}}),
+        );
+        assert_eq!(agent.thread_kind, "subagent");
+        assert_eq!(agent.parent_id, "parent");
+        assert_eq!(agent.agent_name, "Helper");
     }
 }
