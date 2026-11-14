@@ -1,7 +1,7 @@
 use crate::collector;
 use crate::model::{
     is_agent_tool, now_ms, AgentEvent, Compaction, CostMember, CostSummary, ModelRequest, Session,
-    Snapshot, Tool,
+    Snapshot, Tool, TurnTimeline,
 };
 use crate::stats::SessionStats;
 use crate::{pricing, resources, stats, theme};
@@ -671,6 +671,47 @@ enum TimelineRow<'a> {
     Compaction(&'a Compaction),
 }
 
+/// Borrow each row's original turn so details never search a different turn's records.
+#[derive(Clone, Copy)]
+struct TimelineScope<'a> {
+    turn_id: &'a str,
+    tools: &'a [Tool],
+    agent_events: &'a [AgentEvent],
+    requests: &'a [ModelRequest],
+    compactions: &'a [Compaction],
+    archived: bool,
+}
+
+impl<'a> TimelineScope<'a> {
+    fn current(session: &'a Session) -> Self {
+        Self {
+            turn_id: &session.turn_id,
+            tools: &session.tools,
+            agent_events: &session.agent_events,
+            requests: &session.requests,
+            compactions: &session.compactions,
+            archived: false,
+        }
+    }
+
+    fn history(turn: &'a TurnTimeline) -> Self {
+        Self {
+            turn_id: &turn.turn_id,
+            tools: &turn.tools,
+            agent_events: &turn.agent_events,
+            requests: &turn.requests,
+            compactions: &turn.compactions,
+            archived: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TimelineEntry<'a> {
+    row: TimelineRow<'a>,
+    scope: TimelineScope<'a>,
+}
+
 impl TimelineRow<'_> {
     fn operation_title(self) -> String {
         let suffix = |compaction: bool| if compaction { " · 压缩" } else { "" };
@@ -717,6 +758,15 @@ impl TimelineRow<'_> {
             Self::Agent(e) => ("agent", &e.id),
             Self::Model(r) => ("model", &r.id),
             Self::Compaction(c) => ("compaction", &c.id),
+        }
+    }
+
+    fn unfinished(self) -> bool {
+        match self {
+            Self::Tool(t) => t.ended_ms.is_none(),
+            Self::Model(r) => r.ended_ms.is_none(),
+            Self::Compaction(c) => c.ended_ms.is_none(),
+            Self::Agent(_) => false,
         }
     }
 }
@@ -792,7 +842,7 @@ fn render_timeline(
         });
     });
     ui.label(
-        RichText::new("仅展示本轮记录；子智能体事件也可在“工具”中查看。")
+        RichText::new("展示会话近期记录，跨轮次保留；子智能体事件也可在“工具”中查看。")
             .small()
             .color(theme::MUTED),
     );
@@ -819,31 +869,56 @@ fn render_timeline(
         ui.add_space(30.0);
         ui.label(RichText::new("当前筛选暂无匹配的操作").color(theme::MUTED));
     }
-    for row in rows.into_iter().take(300) {
-        ui.push_id((&s.id, row.key()), |ui| {
-            timeline_card(ui, row, s, sessions, costs, columns)
+    for entry in rows.into_iter().take(300) {
+        ui.push_id((&s.id, entry.scope.turn_id, entry.row.key()), |ui| {
+            timeline_card(ui, entry, s, sessions, costs, columns)
         });
         ui.add_space(5.0);
     }
 }
 
 /// Apply type and keyword filters together before limiting the visible history.
-fn timeline_rows<'a>(s: &'a Session, filter: Filter, search: &str) -> Vec<TimelineRow<'a>> {
+fn timeline_rows<'a>(s: &'a Session, filter: Filter, search: &str) -> Vec<TimelineEntry<'a>> {
     let mut rows = Vec::new();
-    if matches!(filter, Filter::All | Filter::Tools) {
-        rows.extend(s.tools.iter().map(TimelineRow::Tool));
-        rows.extend(s.agent_events.iter().map(TimelineRow::Agent));
-    }
-    if matches!(filter, Filter::All | Filter::Models) {
-        rows.extend(s.requests.iter().map(TimelineRow::Model));
-    }
-    if matches!(filter, Filter::All | Filter::Compactions) {
-        rows.extend(s.compactions.iter().map(TimelineRow::Compaction));
+    let scopes = std::iter::once(TimelineScope::current(s))
+        .chain(s.timeline_history.iter().map(TimelineScope::history));
+    for scope in scopes {
+        append_timeline_rows(&mut rows, scope, filter);
     }
     let needle = search.trim().to_lowercase();
-    rows.retain(|row| row.matches_search(&needle));
-    rows.sort_by(|a, b| b.time().cmp(&a.time()).then(a.key().cmp(&b.key())));
+    rows.retain(|entry| entry.row.matches_search(&needle));
+    rows.sort_by(|a, b| {
+        b.row
+            .time()
+            .cmp(&a.row.time())
+            .then(a.row.key().cmp(&b.row.key()))
+            .then(a.scope.turn_id.cmp(b.scope.turn_id))
+    });
     rows
+}
+
+fn append_timeline_rows<'a>(
+    rows: &mut Vec<TimelineEntry<'a>>,
+    scope: TimelineScope<'a>,
+    filter: Filter,
+) {
+    let entry = |row| TimelineEntry { row, scope };
+    if matches!(filter, Filter::All | Filter::Tools) {
+        rows.extend(scope.tools.iter().map(TimelineRow::Tool).map(entry));
+        rows.extend(scope.agent_events.iter().map(TimelineRow::Agent).map(entry));
+    }
+    if matches!(filter, Filter::All | Filter::Models) {
+        rows.extend(scope.requests.iter().map(TimelineRow::Model).map(entry));
+    }
+    if matches!(filter, Filter::All | Filter::Compactions) {
+        rows.extend(
+            scope
+                .compactions
+                .iter()
+                .map(TimelineRow::Compaction)
+                .map(entry),
+        );
+    }
 }
 
 fn filter_buttons(ui: &mut egui::Ui, filter: &mut Filter) {
@@ -903,30 +978,36 @@ fn timeline_heading(ui: &mut egui::Ui) -> Columns {
 
 fn timeline_card(
     ui: &mut egui::Ui,
-    row: TimelineRow<'_>,
+    entry: TimelineEntry<'_>,
     session: &Session,
     sessions: &[Session],
     costs: &[CostMember],
     columns: Columns,
 ) {
     timeline_frame().show(ui, |ui| {
+        let row = entry.row;
         let id = ui.make_persistent_id(row.key());
         let mut open =
             egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
         let (rect, response) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), 42.0), Sense::click());
-        paint_timeline_row(ui, rect, columns, row, session.ended_ms, open.is_open());
+        paint_timeline_row(ui, rect, columns, entry, session.ended_ms, open.is_open());
         if response.clicked() {
             open.toggle(ui);
         }
         response.on_hover_text("点击展开详情");
         open.show_body_unindented(ui, |ui| {
             ui.add_space(6.0);
+            meta_line(ui, "轮次", entry.scope.turn_id);
+            if entry.scope.archived && row.unfinished() {
+                ui.small("结束未观测；历史记录的耗时未知。");
+            }
             match row {
                 TimelineRow::Tool(t) => {
                     tool_details(ui, t);
                     if is_agent_tool(t) {
-                        if let Some(event) = session.agent_events.iter().find(|e| e.id == t.id) {
+                        if let Some(event) = entry.scope.agent_events.iter().find(|e| e.id == t.id)
+                        {
                             agent_stats(ui, event, sessions, costs);
                         }
                     }
@@ -936,7 +1017,7 @@ fn timeline_card(
                     agent_stats(ui, e, sessions, costs);
                 }
                 TimelineRow::Model(r) => request_details(ui, r),
-                TimelineRow::Compaction(c) => compaction_details(ui, c, session),
+                TimelineRow::Compaction(c) => compaction_details(ui, c, entry.scope),
             }
         });
     });
@@ -946,10 +1027,11 @@ fn paint_timeline_row(
     ui: &egui::Ui,
     rect: Rect,
     columns: Columns,
-    row: TimelineRow<'_>,
+    entry: TimelineEntry<'_>,
     task_end: Option<i64>,
     open: bool,
 ) {
+    let row = entry.row;
     let cells = columns.at_row(rect);
     let painter = ui.painter();
     let arrow = if open { "−" } else { "+" };
@@ -960,7 +1042,8 @@ fn paint_timeline_row(
         FontId::monospace(12.0),
         theme::MUTED,
     );
-    let (kind, title, status, elapsed, output, fill) = row_summary(row, task_end);
+    let (kind, title, status, elapsed, output, fill) =
+        row_summary(row, task_end, entry.scope.archived);
     timeline_text(
         painter,
         cells[0],
@@ -1011,15 +1094,27 @@ fn timeline_text(
 fn row_summary(
     row: TimelineRow<'_>,
     task_end: Option<i64>,
+    archived: bool,
 ) -> (&str, String, String, String, String, Color32) {
+    let status = |end: Option<i64>, reported: &str| {
+        if archived && end.is_none() {
+            "结束未观测".to_owned()
+        } else {
+            reported.to_owned()
+        }
+    };
     match row {
         TimelineRow::Tool(t) => {
-            let end = t.ended_ms.or(task_end).unwrap_or_else(now_ms);
+            let end = if archived {
+                t.ended_ms
+            } else {
+                t.ended_ms.or(task_end)
+            };
             (
                 if is_agent_tool(t) { "AGENT" } else { "TOOL" },
                 row.operation_title(),
-                t.status.clone(),
-                compact_duration(end.saturating_sub(t.started_ms).max(0)),
+                status(t.ended_ms, &t.status),
+                observed_duration(Some(t.started_ms), end, archived),
                 "—".into(),
                 if is_agent_tool(t) {
                     theme::BLUE
@@ -1029,21 +1124,11 @@ fn row_summary(
             )
         }
         TimelineRow::Model(r) => {
-            let elapsed = r
-                .started_ms
-                .map(|start| {
-                    compact_duration(
-                        r.ended_ms
-                            .unwrap_or_else(now_ms)
-                            .saturating_sub(start)
-                            .max(0),
-                    )
-                })
-                .unwrap_or_else(|| "—".into());
+            let elapsed = observed_duration(r.started_ms, r.ended_ms, archived);
             (
                 "LLM",
                 row.operation_title(),
-                r.status.clone(),
+                status(r.ended_ms, &r.status),
                 elapsed,
                 r.output_tokens.map(number).unwrap_or_else(|| "—".into()),
                 theme::PINK_SOFT,
@@ -1052,8 +1137,8 @@ fn row_summary(
         TimelineRow::Compaction(c) => (
             "CMP",
             row.operation_title(),
-            c.status.clone(),
-            observed_duration(c.started_ms, c.ended_ms),
+            status(c.ended_ms, &c.status),
+            observed_duration(c.started_ms, c.ended_ms, archived),
             "—".into(),
             theme::YELLOW_SOFT,
         ),
@@ -1318,28 +1403,31 @@ fn cost_grid(ui: &mut egui::Ui, s: &Session, c: &CostSummary) {
         });
 }
 
-fn observed_duration(start: Option<i64>, end: Option<i64>) -> String {
+fn observed_duration(start: Option<i64>, end: Option<i64>, archived: bool) -> String {
+    if archived && end.is_none() {
+        return "未知".into();
+    }
     start
         .map(|start| compact_duration(end.unwrap_or_else(now_ms).saturating_sub(start).max(0)))
         .unwrap_or_else(|| "—".into())
 }
 
 /// Compression rows summarize children without adding their token costs a second time.
-fn compaction_details(ui: &mut egui::Ui, c: &Compaction, session: &Session) {
+fn compaction_details(ui: &mut egui::Ui, c: &Compaction, scope: TimelineScope<'_>) {
     meta_line(ui, "压缩 ID", &c.id);
     meta_line(ui, "触发方式", &c.trigger);
     ui.small(format!(
         "开始 {}    结束 {}    总耗时 {}",
         clock(c.started_ms),
         clock(c.ended_ms),
-        observed_duration(c.started_ms, c.ended_ms)
+        observed_duration(c.started_ms, c.ended_ms, scope.archived)
     ));
-    let requests: Vec<_> = session
+    let requests: Vec<_> = scope
         .requests
         .iter()
         .filter(|r| r.compaction_id.as_deref() == Some(c.id.as_str()))
         .collect();
-    let tools: Vec<_> = session
+    let tools: Vec<_> = scope
         .tools
         .iter()
         .filter(|t| t.compaction_id.as_deref() == Some(c.id.as_str()))
@@ -1729,13 +1817,159 @@ mod tests {
         ] {
             let actual: Vec<_> = timeline_rows(&session, filter, query)
                 .iter()
-                .map(|row| row.key().1.to_owned())
+                .map(|entry| entry.row.key().1.to_owned())
                 .collect();
             assert_eq!(actual, expected, "query: {query}");
         }
-        let event_row = row_summary(TimelineRow::Agent(&session.agent_events[0]), None);
+        let event_row = row_summary(TimelineRow::Agent(&session.agent_events[0]), None, false);
         assert_eq!(event_row.0, "AGENT");
         assert_eq!(event_row.3, "—");
+    }
+
+    // Switching turns retains searchable old commands and model snapshots in chronological order.
+    #[test]
+    fn timeline_search_includes_prior_turn_commands_and_models() {
+        let session = Session {
+            turn_id: "current".into(),
+            requests: vec![ModelRequest {
+                id: "new-request".into(),
+                model: "gpt-6-luna".into(),
+                started_ms: Some(40),
+                ..ModelRequest::default()
+            }],
+            timeline_history: vec![TurnTimeline {
+                turn_id: "previous".into(),
+                tools: vec![Tool {
+                    id: "old-tool".into(),
+                    name: "exec".into(),
+                    details: "cargo profile --old-turn".into(),
+                    started_ms: 20,
+                    ..Tool::default()
+                }],
+                requests: vec![ModelRequest {
+                    id: "old-request".into(),
+                    model: "gpt-6.1-sol".into(),
+                    started_ms: Some(10),
+                    ..ModelRequest::default()
+                }],
+                ..TurnTimeline::default()
+            }],
+            ..Session::default()
+        };
+        let all: Vec<_> = timeline_rows(&session, Filter::All, "")
+            .iter()
+            .map(|entry| entry.row.key().1.to_owned())
+            .collect();
+        assert_eq!(all, ["new-request", "old-tool", "old-request"]);
+        for (filter, query, expected) in [
+            (Filter::Tools, "PROFILE", "old-tool"),
+            (Filter::Models, "gpt-6.1", "old-request"),
+        ] {
+            let rows = timeline_rows(&session, filter, query);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].row.key().1, expected);
+            assert_eq!(rows[0].scope.turn_id, "previous");
+            assert!(rows[0].scope.archived);
+        }
+    }
+
+    // An unfinished archived operation never inherits a later turn's end or keeps counting upwards.
+    #[test]
+    fn historical_open_rows_keep_unknown_status_and_duration() {
+        let session = Session {
+            timeline_history: vec![TurnTimeline {
+                turn_id: "old".into(),
+                tools: vec![Tool {
+                    started_ms: 10,
+                    ..Tool::default()
+                }],
+                requests: vec![ModelRequest {
+                    started_ms: Some(20),
+                    ..ModelRequest::default()
+                }],
+                compactions: vec![Compaction {
+                    started_ms: Some(30),
+                    ..Compaction::default()
+                }],
+                ..TurnTimeline::default()
+            }],
+            ..Session::default()
+        };
+        let rows = timeline_rows(&session, Filter::All, "");
+        assert_eq!(rows.len(), 3);
+        for entry in rows {
+            for later_end in [Some(1000), Some(999_999), None] {
+                let summary = row_summary(entry.row, later_end, entry.scope.archived);
+                assert_eq!(summary.2, "结束未观测");
+                assert_eq!(summary.3, "未知");
+            }
+        }
+    }
+
+    // Old compactions read only their own turn's children, even when another turn reuses the same ID.
+    #[test]
+    fn historical_compaction_details_keep_original_children_and_unknown_end() {
+        let session = Session {
+            requests: vec![ModelRequest {
+                id: "current-request".into(),
+                model: "current-model".into(),
+                compaction_id: Some("compact".into()),
+                output_tokens: Some(9999),
+                cost_usd: Some(99.0),
+                ..ModelRequest::default()
+            }],
+            timeline_history: vec![TurnTimeline {
+                turn_id: "old".into(),
+                compactions: vec![Compaction {
+                    id: "compact".into(),
+                    started_ms: Some(10),
+                    ..Compaction::default()
+                }],
+                tools: vec![Tool {
+                    name: "original-tool".into(),
+                    compaction_id: Some("compact".into()),
+                    ..Tool::default()
+                }],
+                requests: vec![ModelRequest {
+                    id: "old-request".into(),
+                    model: "original-model".into(),
+                    compaction_id: Some("compact".into()),
+                    output_tokens: Some(10),
+                    cost_usd: Some(0.03),
+                    ..ModelRequest::default()
+                }],
+                ..TurnTimeline::default()
+            }],
+            ..Session::default()
+        };
+        let context = egui::Context::default();
+        let output = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let scope = TimelineScope::history(&session.timeline_history[0]);
+                compaction_details(ui, &scope.compactions[0], scope);
+            });
+        });
+        let text = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "总耗时 未知",
+            "已观测子模型请求 1 次 · 子工具调用 1 次",
+            "$0.03",
+            "original-model",
+            "original-tool",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        for absent in ["current-model", "$99.00", "9,999"] {
+            assert!(!text.contains(absent), "unexpected {absent}: {text}");
+        }
     }
 
     // Navigation must leave space for overview and resources at normal and compact heights.

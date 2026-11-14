@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::mem;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -39,6 +40,7 @@ pub struct Session {
     pub tools: Vec<Tool>,
     pub agent_events: Vec<AgentEvent>,
     pub requests: Vec<ModelRequest>,
+    pub timeline_history: Vec<TurnTimeline>,
     pub cost: CostSummary,
     pub legacy_usage_gaps: Vec<LegacyUsageGap>,
     pub legacy_canonical_output: Vec<(String, u64)>,
@@ -129,6 +131,26 @@ pub struct Compaction {
     pub trigger: String,
     pub status: String,
     pub hook_pending: bool,
+}
+
+/// Previous turns retain display records without participating in live request matching or counters.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TurnTimeline {
+    pub turn_id: String,
+    pub tools: Vec<Tool>,
+    pub agent_events: Vec<AgentEvent>,
+    pub requests: Vec<ModelRequest>,
+    pub compactions: Vec<Compaction>,
+}
+
+impl TurnTimeline {
+    fn has_records(&self) -> bool {
+        !self.tools.is_empty()
+            || !self.agent_events.is_empty()
+            || !self.requests.is_empty()
+            || !self.compactions.is_empty()
+    }
 }
 
 fn standard_tier() -> String {
@@ -914,19 +936,45 @@ pub fn apply_with_billing(s: &mut Session, row: &Value, allow_charge: bool) {
     trim_tools(s);
 }
 
+/// Current and archived records share the original limits, so history adds no unbounded row cache.
 fn trim_tools(s: &mut Session) {
-    if s.agent_events.len() > 100 {
-        s.agent_events.drain(..s.agent_events.len() - 100);
+    let mut tools = 100;
+    let mut agents = 100;
+    let mut requests = 100;
+    let mut compactions = 50;
+    retain_recent(&mut s.tools, &mut tools);
+    retain_recent(&mut s.agent_events, &mut agents);
+    retain_recent(&mut s.requests, &mut requests);
+    retain_recent(&mut s.compactions, &mut compactions);
+    for turn in s.timeline_history.iter_mut().rev() {
+        retain_recent(&mut turn.tools, &mut tools);
+        retain_recent(&mut turn.agent_events, &mut agents);
+        retain_recent(&mut turn.requests, &mut requests);
+        retain_recent(&mut turn.compactions, &mut compactions);
     }
-    if s.compactions.len() > 50 {
-        s.compactions.drain(..s.compactions.len() - 50);
+    s.timeline_history.retain(TurnTimeline::has_records);
+}
+
+/// Spend a shared per-kind row budget on the newest records first.
+fn retain_recent<T>(records: &mut Vec<T>, remaining: &mut usize) {
+    let remove = records.len().saturating_sub(*remaining);
+    records.drain(..remove);
+    *remaining -= records.len();
+}
+
+/// Move records into a display-only snapshot before the next turn resets live state.
+fn archive_timeline(s: &mut Session) {
+    let previous = TurnTimeline {
+        turn_id: s.turn_id.clone(),
+        tools: mem::take(&mut s.tools),
+        agent_events: mem::take(&mut s.agent_events),
+        requests: mem::take(&mut s.requests),
+        compactions: mem::take(&mut s.compactions),
+    };
+    if previous.has_records() {
+        s.timeline_history.push(previous);
     }
-    if s.requests.len() > 100 {
-        s.requests.drain(..s.requests.len() - 100);
-    }
-    if s.tools.len() > 100 {
-        s.tools.drain(..s.tools.len() - 100);
-    }
+    trim_tools(s);
 }
 
 /// Observe only explicit tier fields. Missing tier metadata never turns Fast off.
@@ -1195,6 +1243,7 @@ fn begin(s: &mut Session, id: String, ts: i64) {
     }
     // Current-turn counters are transient; preserve any proven missing usage before resetting them.
     mark_unpriced_legacy_usage(s);
+    archive_timeline(s);
     s.turn_id = id;
     s.started_ms = Some(ts);
     s.ended_ms = None;
@@ -1206,10 +1255,6 @@ fn begin(s: &mut Session, id: String, ts: i64) {
     s.model_boundary_ms = 0;
     s.seen_responses.clear();
     s.record_tokens = 0;
-    s.tools.clear();
-    s.agent_events.clear();
-    s.requests.clear();
-    s.compactions.clear();
     s.active_compaction = None;
     s.phase = "等待后续事件（模型/网络状态未知）".into();
 }
@@ -2129,6 +2174,130 @@ fn model_hook(s: &mut Session, p: &Value, ts: i64, name: &str) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // Model changes and the following new turn retain prior rows while matching only new live requests.
+    #[test]
+    fn model_switch_and_next_turn_preserve_timeline_without_live_state_leakage() {
+        let mut s = coverage_session();
+        s.tools.push(Tool {
+            id: "tool".into(),
+            ..Tool::default()
+        });
+        s.agent_events.push(AgentEvent {
+            id: "agent".into(),
+            ..AgentEvent::default()
+        });
+        s.compactions.push(Compaction {
+            id: "compact".into(),
+            ..Compaction::default()
+        });
+        s.requests.push(ModelRequest {
+            id: "old".into(),
+            model: "gpt-6.1-sol".into(),
+            source: "hook".into(),
+            started_ms: Some(1500),
+            ..ModelRequest::default()
+        });
+        s.output_tokens = 17;
+        s.request_tps = Some(42.0);
+        let cost = serde_json::to_value(&s.cost).unwrap();
+        apply(
+            &mut s,
+            &json!({"type":"turn_context","timestamp_ms":2000,
+            "payload":{"turn_id":"two","model":"gpt-6-luna"}}),
+        );
+        assert_eq!(s.requests.len(), 1);
+        apply(
+            &mut s,
+            &json!({"type":"event_msg","timestamp_ms":2100,
+            "payload":{"type":"task_started","turn_id":"two"}}),
+        );
+        let old = &s.timeline_history[0];
+        assert_eq!(old.turn_id, "one");
+        assert_eq!(old.tools[0].id, "tool");
+        assert_eq!(old.agent_events[0].id, "agent");
+        assert_eq!(old.compactions[0].id, "compact");
+        assert_eq!(old.requests[0].model, "gpt-6.1-sol");
+        assert!(s.tools.is_empty() && s.requests.is_empty() && s.compactions.is_empty());
+        assert_eq!(s.output_tokens, 0);
+        assert_eq!(s.request_tps, None);
+        apply(
+            &mut s,
+            &json!({"type":"monitor_hook","timestamp_ms":2200,
+            "payload":{"hook_event_name":"PreModelRequest","turn_id":"two"}}),
+        );
+        assert_eq!(s.requests.len(), 1);
+        assert_eq!(s.requests[0].started_ms, Some(2200));
+        assert_eq!(s.requests[0].model, "gpt-6-luna");
+        assert_eq!(serde_json::to_value(&s.cost).unwrap(), cost);
+        let restored: Session = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(restored.timeline_history[0].requests[0].id, "old");
+        assert_eq!(restored.requests.len(), 1);
+    }
+
+    // Active and old turns share their existing row budgets, and empty turns add no history objects.
+    #[test]
+    fn archived_timeline_shares_bounded_capacity_with_current_turn() {
+        let mut s = Session::default();
+        for index in 0..120 {
+            begin(&mut s, index.to_string(), index);
+            s.tools.push(Tool {
+                id: index.to_string(),
+                ..Tool::default()
+            });
+            s.requests.push(ModelRequest {
+                id: index.to_string(),
+                ..ModelRequest::default()
+            });
+            s.agent_events.push(AgentEvent {
+                id: index.to_string(),
+                ..AgentEvent::default()
+            });
+            s.compactions.push(Compaction {
+                id: index.to_string(),
+                ..Compaction::default()
+            });
+            trim_tools(&mut s);
+        }
+        assert_eq!(
+            s.tools.len()
+                + s.timeline_history
+                    .iter()
+                    .map(|h| h.tools.len())
+                    .sum::<usize>(),
+            100
+        );
+        assert_eq!(
+            s.requests.len()
+                + s.timeline_history
+                    .iter()
+                    .map(|h| h.requests.len())
+                    .sum::<usize>(),
+            100
+        );
+        assert_eq!(
+            s.agent_events.len()
+                + s.timeline_history
+                    .iter()
+                    .map(|h| h.agent_events.len())
+                    .sum::<usize>(),
+            100
+        );
+        assert_eq!(
+            s.compactions.len()
+                + s.timeline_history
+                    .iter()
+                    .map(|h| h.compactions.len())
+                    .sum::<usize>(),
+            50
+        );
+        assert_eq!(s.timeline_history[0].tools[0].id, "20");
+        for index in 120..500 {
+            begin(&mut s, index.to_string(), index);
+        }
+        assert_eq!(s.timeline_history.len(), 100);
+        assert!(s.timeline_history.iter().all(TurnTimeline::has_records));
+    }
 
     // Old receipts can restore request details after UI eviction without adding output or false gaps.
     #[test]
