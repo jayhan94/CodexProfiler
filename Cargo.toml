@@ -2,6 +2,8 @@
 name = "codex-profiler"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/jayhan94/CodexProfiler"
 
 [dependencies]
 eframe = { version = "0.31", default-features = false, features = ["glow", "x11", "wayland", "default_fonts"] }

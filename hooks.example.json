@@ -4,8 +4,8 @@
       {
         "hooks": [
           {
-            "command": "\"D:\\OpenSource\\CodexProfiler\\dist\\codex-profiler.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
-            "commandWindows": "cmd.exe /d /c call \"D:\\OpenSource\\CodexProfiler\\dist\\codex-profiler.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "command": "codex-profiler --hook",
+            "commandWindows": "cmd.exe /d /c call codex-profiler.exe --hook",
             "timeout": 3,
             "type": "command"
           }
@@ -16,8 +16,8 @@
       {
         "hooks": [
           {
-            "command": "\"D:\\OpenSource\\CodexProfiler\\dist\\codex-profiler.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
-            "commandWindows": "cmd.exe /d /c call \"D:\\OpenSource\\CodexProfiler\\dist\\codex-profiler.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "command": "codex-profiler --hook",
+            "commandWindows": "cmd.exe /d /c call codex-profiler.exe --hook",
             "timeout": 3,
             "type": "command"
           }
@@ -28,8 +28,8 @@
       {
         "hooks": [
           {
-            "command": "\"D:\\OpenSource\\CodexProfiler\\dist\\codex-profiler.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
-            "commandWindows": "cmd.exe /d /c call \"D:\\OpenSource\\CodexProfiler\\dist\\codex-profiler.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "command": "codex-profiler --hook",
+            "commandWindows": "cmd.exe /d /c call codex-profiler.exe --hook",
             "timeout": 3,
             "type": "command"
           }
@@ -40,8 +40,8 @@
       {
         "hooks": [
           {
-            "command": "\"D:\\OpenSource\\CodexProfiler\\dist\\codex-profiler.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
-            "commandWindows": "cmd.exe /d /c call \"D:\\OpenSource\\CodexProfiler\\dist\\codex-profiler.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "command": "codex-profiler --hook",
+            "commandWindows": "cmd.exe /d /c call codex-profiler.exe --hook",
             "timeout": 3,
             "type": "command"
           }
@@ -52,8 +52,8 @@
       {
         "hooks": [
           {
-            "command": "\"D:\\OpenSource\\CodexProfiler\\dist\\codex-profiler.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
-            "commandWindows": "cmd.exe /d /c call \"D:\\OpenSource\\CodexProfiler\\dist\\codex-profiler.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "command": "codex-profiler --hook",
+            "commandWindows": "cmd.exe /d /c call codex-profiler.exe --hook",
             "timeout": 3,
             "type": "command"
           }
@@ -64,8 +64,8 @@
       {
         "hooks": [
           {
-            "command": "\"D:\\OpenSource\\CodexProfiler\\dist\\codex-profiler.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
-            "commandWindows": "cmd.exe /d /c call \"D:\\OpenSource\\CodexProfiler\\dist\\codex-profiler.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "command": "codex-profiler --hook",
+            "commandWindows": "cmd.exe /d /c call codex-profiler.exe --hook",
             "timeout": 3,
             "type": "command"
           }
@@ -76,8 +76,8 @@
       {
         "hooks": [
           {
-            "command": "\"D:\\OpenSource\\CodexProfiler\\dist\\codex-profiler.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
-            "commandWindows": "cmd.exe /d /c call \"D:\\OpenSource\\CodexProfiler\\dist\\codex-profiler.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "command": "codex-profiler --hook",
+            "commandWindows": "cmd.exe /d /c call codex-profiler.exe --hook",
             "timeout": 3,
             "type": "command"
           }
@@ -88,8 +88,8 @@
       {
         "hooks": [
           {
-            "command": "\"D:\\OpenSource\\CodexProfiler\\dist\\codex-profiler.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
-            "commandWindows": "cmd.exe /d /c call \"D:\\OpenSource\\CodexProfiler\\dist\\codex-profiler.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "command": "codex-profiler --hook",
+            "commandWindows": "cmd.exe /d /c call codex-profiler.exe --hook",
             "timeout": 3,
             "type": "command"
           }
@@ -100,8 +100,8 @@
       {
         "hooks": [
           {
-            "command": "\"D:\\OpenSource\\CodexProfiler\\dist\\codex-profiler.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
-            "commandWindows": "cmd.exe /d /c call \"D:\\OpenSource\\CodexProfiler\\dist\\codex-profiler.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "command": "codex-profiler --hook",
+            "commandWindows": "cmd.exe /d /c call codex-profiler.exe --hook",
             "timeout": 3,
             "type": "command"
           }
@@ -112,13 +112,14 @@
       {
         "hooks": [
           {
-            "command": "\"D:\\OpenSource\\CodexProfiler\\dist\\codex-profiler.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
-            "commandWindows": "cmd.exe /d /c call \"D:\\OpenSource\\CodexProfiler\\dist\\codex-profiler.exe\" --hook --codex-home \"C:\\Users\\15110\\.codex\"",
+            "command": "codex-profiler --hook",
+            "commandWindows": "cmd.exe /d /c call codex-profiler.exe --hook",
             "timeout": 3,
             "type": "command"
           }
         ]
       }
     ]
-  }
+  },
+  "description": "Portable example. Run codex-profiler --print-hooks to generate paths for your machine."
 }
