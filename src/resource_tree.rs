@@ -221,18 +221,6 @@ impl<'a> SessionTree<'a> {
                             );
                         }
                     }
-                    for id in self.nodes.keys() {
-                        if !shown.contains(id) {
-                            self.branch(
-                                ui,
-                                snapshot,
-                                id,
-                                selected_session,
-                                selected_process,
-                                &mut shown,
-                            );
-                        }
-                    }
                 }
                 self.unowned(
                     ui,
@@ -355,6 +343,48 @@ fn short(text: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Collapsing a parent must hide its child session instead of promoting it to another root.
+    #[test]
+    fn all_session_view_keeps_child_hidden_under_collapsed_parent() {
+        let rows = vec![process(1, Some("child"), 1.0, 100)];
+        let metadata = vec![
+            CostMember {
+                id: "parent".into(),
+                title: "parent-title".into(),
+                ..CostMember::default()
+            },
+            CostMember {
+                id: "child".into(),
+                parent_id: "parent".into(),
+                thread_kind: "subagent".into(),
+                title: "hidden-child-title".into(),
+                ..CostMember::default()
+            },
+        ];
+        let tree = SessionTree::new(&rows, &metadata, None);
+        let mut snapshot = Snapshot::default();
+        snapshot.rows = rows.clone();
+        let context = egui::Context::default();
+        let output = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default()
+                .show(ctx, |ui| tree.show(ui, &snapshot, None, None, &mut None));
+        });
+        let text = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("parent-title"));
+        assert!(
+            !text.contains("hidden-child-title"),
+            "collapsed child leaked: {text}"
+        );
+    }
 
     fn process(pid: u32, owner: Option<&str>, cpu: f32, memory: u64) -> ProcessRow {
         ProcessRow {
