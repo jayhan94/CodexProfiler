@@ -1,4 +1,6 @@
+use crate::repl_activity::{ActiveExec, ReplActivity};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 pub type Identity = (u32, u64);
@@ -21,6 +23,7 @@ impl ProcessRef {
 struct Ownership {
     thread_id: Option<String>,
     explicit: bool,
+    conflicted: bool,
     attempts: u8,
     parent_pid: Option<u32>,
     parent_identity: Option<Identity>,
@@ -31,9 +34,27 @@ struct Ownership {
 pub struct OwnershipTracker {
     known: HashMap<Identity, Ownership>,
     last_error: Option<String>,
+    repl_activity: Option<ReplActivity>,
+    repl_records: Vec<ActiveExec>,
+    repl_kernels: HashSet<Identity>,
 }
 
 impl OwnershipTracker {
+    /// Start native marker capture before process sampling so short executions remain attributable.
+    pub fn new(codex_home: &Path) -> Self {
+        Self {
+            repl_activity: Some(ReplActivity::new(codex_home)),
+            ..Self::default()
+        }
+    }
+
+    /// Drain markers before refreshing processes, so their kernels can exist in that snapshot.
+    pub fn capture_activity(&mut self) {
+        if let Some(activity) = &mut self.repl_activity {
+            self.repl_records = activity.drain();
+        }
+    }
+
     /// Attribute only processes with an explicit thread UUID or a verified process ancestor.
     pub fn sample(&mut self, processes: &[ProcessRef]) -> HashMap<Identity, String> {
         self.sample_with(processes, read_thread_ids)
@@ -49,6 +70,8 @@ impl OwnershipTracker {
         processes: &[ProcessRef],
         read: impl FnOnce(&[Identity]) -> Result<HashMap<Identity, String>, String>,
     ) -> HashMap<Identity, String> {
+        let processes = session_processes(processes, &self.repl_records, &mut self.repl_kernels);
+        let processes = processes.as_slice();
         let by_pid: HashMap<_, _> = processes.iter().map(|p| (p.pid, p)).collect();
         let live: HashSet<_> = processes.iter().map(ProcessRef::identity).collect();
         self.known.retain(|identity, _| live.contains(identity));
@@ -68,6 +91,13 @@ impl OwnershipTracker {
         }
         if !candidates.is_empty() {
             self.read_candidates(&candidates, read);
+        }
+        apply_repl_records(&self.repl_records, &by_pid, &mut self.known);
+        self.repl_records.clear();
+        if let Some(activity) = &self.repl_activity {
+            if let Some(error) = activity.last_error() {
+                self.last_error = Some(error);
+            }
         }
         let resolved = resolve_owners(processes, &by_pid, &self.known);
         let mut owners = HashMap::new();
@@ -93,8 +123,7 @@ impl OwnershipTracker {
                         continue;
                     };
                     let ownership = self.known.get_mut(identity).unwrap();
-                    ownership.thread_id = Some(thread_id);
-                    ownership.explicit = true;
+                    bind_thread(ownership, thread_id);
                 }
             }
             Err(error) => self.last_error = Some(error),
@@ -102,11 +131,100 @@ impl OwnershipTracker {
     }
 }
 
+/// A native kernel may itself be codex.exe; only verified kernel identities bypass root sharing.
+fn session_processes(
+    processes: &[ProcessRef],
+    records: &[ActiveExec],
+    kernels: &mut HashSet<Identity>,
+) -> Vec<ProcessRef> {
+    let live: HashSet<_> = processes.iter().map(ProcessRef::identity).collect();
+    kernels.retain(|identity| live.contains(identity));
+    let by_pid = processes
+        .iter()
+        .map(|process| (process.pid, process))
+        .collect();
+    for record in records {
+        if thread_uuid(&record.session_id).is_some() {
+            if let Some((_, kernel)) = validated_repl_pair(record, &by_pid) {
+                kernels.insert(kernel.identity());
+            }
+        }
+    }
+    processes
+        .iter()
+        .map(|process| ProcessRef {
+            shared: process.shared && !kernels.contains(&process.identity()),
+            ..*process
+        })
+        .collect()
+}
+
+/// Conflicting direct evidence makes this process unknown for the rest of its observed lifetime.
+fn bind_thread(ownership: &mut Ownership, thread_id: String) {
+    if ownership.explicit && ownership.thread_id.as_ref() != Some(&thread_id) {
+        ownership.conflicted = true;
+    }
+    ownership.thread_id = (!ownership.conflicted).then_some(thread_id);
+    ownership.explicit = true;
+}
+
+/// The installed runtime's sessionId is its Codex thread UUID, verified against a live execution.
+fn apply_repl_records(
+    records: &[ActiveExec],
+    by_pid: &HashMap<u32, &ProcessRef>,
+    known: &mut HashMap<Identity, Ownership>,
+) {
+    for record in records {
+        let Some(thread_id) = thread_uuid(&record.session_id) else {
+            continue;
+        };
+        let Some((node, kernel)) = validated_repl_pair(record, by_pid) else {
+            continue;
+        };
+        for process in [node, kernel] {
+            if let Some(ownership) = known.get_mut(&process.identity()) {
+                bind_thread(ownership, thread_id.clone());
+            }
+        }
+    }
+}
+
+/// Reject stale/reused PIDs and require the kernel's live ancestry to reach its recorded REPL.
+fn validated_repl_pair<'a>(
+    record: &ActiveExec,
+    by_pid: &HashMap<u32, &'a ProcessRef>,
+) -> Option<(&'a ProcessRef, &'a ProcessRef)> {
+    let node = *by_pid.get(&record.node_repl_pid)?;
+    let kernel = *by_pid.get(&record.kernel_pid)?;
+    if node.pid == kernel.pid
+        || node.shared
+        || [node, kernel].iter().any(|process| {
+            process.start_time == 0
+                || process.start_time.saturating_mul(1_000) > record.started_at_ms
+        })
+    {
+        return None;
+    }
+    let mut current = kernel;
+    let mut visited = HashSet::new();
+    while visited.insert(current.identity()) {
+        if current.identity() == node.identity() {
+            return Some((node, kernel));
+        }
+        if current.shared && current.identity() != kernel.identity() {
+            return None;
+        }
+        current = valid_parent(current, by_pid)?;
+    }
+    None
+}
+
 /// Preserve observed ownership after reparenting, without treating a reused parent PID as ancestry.
 fn refresh_link(ownership: &mut Ownership, process: &ProcessRef, parent: Option<Identity>) {
     if process.shared {
         ownership.thread_id = None;
         ownership.explicit = false;
+        ownership.conflicted = false;
         ownership.attempts = 2;
         ownership.detached = false;
     } else if ownership.thread_id.is_some()
@@ -243,6 +361,165 @@ mod tests {
             .iter()
             .map(|(id, value)| (*id, (*value).into()))
             .collect()
+    }
+
+    fn execution(
+        session_id: &str,
+        node_pid: u32,
+        kernel_pid: u32,
+        started_at_ms: u64,
+    ) -> ActiveExec {
+        serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "execId": format!("exec-{node_pid}-{kernel_pid}-{session_id}"),
+            "sessionId": session_id,
+            "turnId": "turn",
+            "nodeReplPid": node_pid,
+            "kernelPid": kernel_pid,
+            "startedAtMs": started_at_ms,
+        }))
+        .unwrap()
+    }
+
+    fn observe_records(
+        tracker: &mut OwnershipTracker,
+        processes: &[ProcessRef],
+        records: &[ActiveExec],
+    ) {
+        let by_pid = processes
+            .iter()
+            .map(|process| (process.pid, process))
+            .collect();
+        apply_repl_records(records, &by_pid, &mut tracker.known);
+    }
+
+    // Real Windows shape: a native codex.exe kernel belongs to the REPL; the main Codex stays shared.
+    #[test]
+    fn native_codex_kernel_overrides_shared_name_for_only_its_verified_identity() {
+        let mut root = process(1, None, 1);
+        root.shared = true;
+        let mut kernel = process(11, Some(10), 3);
+        kernel.shared = true;
+        let mut other_codex = process(13, Some(10), 3);
+        other_codex.shared = true;
+        let processes = [
+            root,
+            process(10, Some(1), 2),
+            kernel,
+            process(12, Some(11), 3),
+            other_codex,
+        ];
+        let mut tracker = OwnershipTracker {
+            repl_records: vec![
+                execution(FIRST, 10, 11, 3_500),
+                execution(FIRST, 10, 1, 3_500),
+            ],
+            ..OwnershipTracker::default()
+        };
+        for _ in 0..3 {
+            let owners = tracker.sample_with(&processes, |_| Ok(HashMap::new()));
+            for identity in [(10, 2), (11, 3), (12, 3)] {
+                assert_eq!(owners[&identity], FIRST);
+            }
+            assert!(!owners.contains_key(&(1, 1)));
+            assert!(!owners.contains_key(&(13, 3)));
+            assert!(!tracker.repl_kernels.contains(&(1, 1)));
+        }
+        let mut reused = processes;
+        reused[2].start_time = 5;
+        reused[3].start_time = 6;
+        let owners = tracker.sample_with(&reused, |_| Ok(HashMap::new()));
+        assert!(!owners.contains_key(&(11, 5)));
+        assert!(!owners.contains_key(&(12, 6)));
+        assert!(!tracker.repl_kernels.contains(&(11, 3)));
+    }
+
+    // A native record identifies REPL descendants while idle; reused PIDs lose the cached evidence.
+    #[test]
+    fn native_record_attributes_repl_and_child_console_after_record_disappears() {
+        let mut root = process(1, None, 1);
+        root.shared = true;
+        let processes = [
+            root,
+            process(10, Some(1), 2),
+            process(11, Some(10), 3),
+            process(12, Some(10), 3),
+            process(20, Some(1), 3),
+        ];
+        let mut tracker = OwnershipTracker::default();
+        tracker.sample_with(&processes, |_| Ok(HashMap::new()));
+        observe_records(&mut tracker, &processes, &[execution(FIRST, 10, 11, 3_500)]);
+        for _ in 0..2 {
+            let owners = tracker.sample_with(&processes, |_| Ok(HashMap::new()));
+            for identity in [(10, 2), (11, 3), (12, 3)] {
+                assert_eq!(owners[&identity], FIRST);
+            }
+            assert!(!owners.contains_key(&(1, 1)));
+            assert!(!owners.contains_key(&(20, 3)));
+        }
+        let reused = [process(10, None, 5), process(11, Some(10), 6)];
+        assert!(tracker
+            .sample_with(&reused, |_| Ok(HashMap::new()))
+            .is_empty());
+    }
+
+    // An old record cannot bind a reused PID, another process's kernel, or a shared intermediary.
+    #[test]
+    fn native_records_require_live_ancestry_and_creation_before_execution() {
+        let mut shared = process(3, Some(1), 2);
+        shared.shared = true;
+        let processes = [
+            process(1, None, 1),
+            process(2, Some(1), 4),
+            shared,
+            process(4, Some(3), 3),
+            process(5, None, 2),
+        ];
+        let mut tracker = OwnershipTracker::default();
+        tracker.sample_with(&processes, |_| Ok(HashMap::new()));
+        observe_records(
+            &mut tracker,
+            &processes,
+            &[
+                execution(FIRST, 1, 2, 3_500),
+                execution(FIRST, 1, 4, 3_500),
+                execution(FIRST, 1, 5, 3_500),
+                execution("session-1", 1, 2, 4_500),
+            ],
+        );
+        assert!(tracker
+            .sample_with(&processes, |_| Ok(HashMap::new()))
+            .is_empty());
+    }
+
+    // Multiple threads may have distinct kernels; conflicting ownership never assigns their host.
+    #[test]
+    fn conflicting_native_records_leave_host_and_its_console_unknown() {
+        let processes = [
+            process(10, None, 1),
+            process(11, Some(10), 2),
+            process(12, Some(10), 2),
+            process(13, Some(10), 2),
+        ];
+        let mut tracker = OwnershipTracker::default();
+        tracker.sample_with(&processes, |_| Ok(HashMap::new()));
+        observe_records(
+            &mut tracker,
+            &processes,
+            &[
+                execution(FIRST, 10, 11, 3_500),
+                execution(SECOND, 10, 12, 3_500),
+            ],
+        );
+        let owners = tracker.sample_with(&processes, |_| Ok(HashMap::new()));
+        assert!(!owners.contains_key(&(10, 1)));
+        assert!(!owners.contains_key(&(13, 2)));
+        assert_eq!(owners[&(11, 2)], FIRST);
+        assert_eq!(owners[&(12, 2)], SECOND);
+        observe_records(&mut tracker, &processes, &[execution(FIRST, 10, 11, 4_500)]);
+        assert!(!tracker
+            .sample_with(&processes, |_| Ok(HashMap::new()))
+            .contains_key(&(10, 1)));
     }
 
     // Two sessions share one application root; tools inherit only their session's UUID.

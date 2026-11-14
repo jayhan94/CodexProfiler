@@ -248,7 +248,7 @@ impl Monitor {
             filter: Filter::default(),
             timeline_search: String::new(),
             page: Page::default(),
-            resources: resources::Monitor::new(context.egui_ctx.clone()),
+            resources: resources::Monitor::new(context.egui_ctx.clone(), source),
         }
     }
 

@@ -175,51 +175,41 @@ impl<'a> SessionTree<'a> {
         usage
     }
 
-    pub fn usage(&self, focused: Option<&str>) -> Usage {
-        match focused {
+    /// Session summaries include descendants; shared and unassigned processes only join the total.
+    pub fn usage(&self, session: Option<&str>) -> Usage {
+        match session {
             Some(id) => self.usage_for(&self.indices(id)),
             None => self.usage_for(&self.all),
         }
     }
 
+    /// Selection opens its ancestor path without filtering other sessions or global process groups.
     pub fn show(
         &self,
         ui: &mut egui::Ui,
         snapshot: &Snapshot,
-        focused: Option<&str>,
         selected_session: Option<&str>,
         selected_process: &mut Option<(u32, u64)>,
     ) {
         egui::ScrollArea::both()
-            .id_salt(("resource-session-tree", focused))
+            .id_salt("resource-session-tree")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let mut shown = HashSet::new();
-                if let Some(id) = focused {
-                    self.branch(
-                        ui,
-                        snapshot,
-                        id,
-                        selected_session,
-                        selected_process,
-                        &mut shown,
-                    );
-                } else {
-                    for (id, node) in &self.nodes {
-                        if node
-                            .parent
-                            .as_ref()
-                            .is_none_or(|parent| !self.nodes.contains_key(parent))
-                        {
-                            self.branch(
-                                ui,
-                                snapshot,
-                                id,
-                                selected_session,
-                                selected_process,
-                                &mut shown,
-                            );
-                        }
+                for (id, node) in &self.nodes {
+                    if node
+                        .parent
+                        .as_ref()
+                        .is_none_or(|parent| !self.nodes.contains_key(parent))
+                    {
+                        self.branch(
+                            ui,
+                            snapshot,
+                            id,
+                            selected_session,
+                            selected_process,
+                            &mut shown,
+                        );
                     }
                 }
                 self.unowned(
@@ -261,9 +251,13 @@ impl<'a> SessionTree<'a> {
             "side_chat" => "侧边聊天",
             _ => "会话",
         };
-        let usage = self.usage_for(&self.indices(id));
+        let usage = self.usage(Some(id));
         let heading = format!("{tag} · {}  |  {}", short(&node.title, 28), usage.label());
-        egui::CollapsingHeader::new(RichText::new(heading).color(theme::INK))
+        let mut heading = RichText::new(heading).color(theme::INK);
+        if Some(id) == selected_session {
+            heading = heading.strong();
+        }
+        egui::CollapsingHeader::new(heading)
             .id_salt(("resource-session", id))
             .default_open(self.is_selected_ancestor(id, selected_session))
             .show(ui, |ui| {
@@ -367,8 +361,7 @@ mod tests {
         snapshot.rows = rows.clone();
         let context = egui::Context::default();
         let output = context.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default()
-                .show(ctx, |ui| tree.show(ui, &snapshot, None, None, &mut None));
+            egui::CentralPanel::default().show(ctx, |ui| tree.show(ui, &snapshot, None, &mut None));
         });
         let text = output
             .shapes
@@ -384,6 +377,71 @@ mod tests {
             !text.contains("hidden-child-title"),
             "collapsed child leaked: {text}"
         );
+    }
+
+    // Selecting one session opens its process rows while other sessions and global groups stay visible.
+    #[test]
+    fn selected_session_keeps_other_roots_and_unowned_groups_visible() {
+        let rows = vec![
+            ProcessRow {
+                name: "selected-process".into(),
+                ..process(1, Some("selected"), 1.0, 100)
+            },
+            process(2, Some("other"), 2.0, 200),
+            ProcessRow {
+                shared: true,
+                ..process(3, None, 4.0, 400)
+            },
+            process(4, None, 8.0, 800),
+        ];
+        let metadata = vec![
+            CostMember {
+                id: "selected".into(),
+                title: "selected-title".into(),
+                ..CostMember::default()
+            },
+            CostMember {
+                id: "other".into(),
+                title: "other-title".into(),
+                ..CostMember::default()
+            },
+        ];
+        let tree = SessionTree::new(&rows, &metadata, Some("selected"));
+        let mut snapshot = Snapshot::default();
+        snapshot.rows = rows.clone();
+        let context = egui::Context::default();
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 900.0),
+                )),
+                ..egui::RawInput::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    tree.show(ui, &snapshot, Some("selected"), &mut None);
+                });
+            },
+        );
+        let text = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "selected-title",
+            "selected-process",
+            "other-title",
+            "共享 Codex 后台进程",
+            "未归属工具进程",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
     }
 
     fn process(pid: u32, owner: Option<&str>, cpu: f32, memory: u64) -> ProcessRow {

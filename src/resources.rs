@@ -4,6 +4,7 @@ use crate::{resource_tree, theme};
 use eframe::egui::{self, RichText};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -76,17 +77,16 @@ pub struct Monitor {
     shared: Arc<Shared>,
     snapshot: Option<Snapshot>,
     selected: Option<Identity>,
-    selected_only: bool,
 }
 
 impl Monitor {
     /// Native sampling happens entirely on a worker; the GUI only reads its latest snapshot.
-    pub fn new(ctx: egui::Context) -> Self {
+    pub fn new(ctx: egui::Context, codex_home: PathBuf) -> Self {
         let shared = Arc::new(Shared::default());
         let worker_shared = Arc::clone(&shared);
         if let Err(error) = thread::Builder::new()
             .name("codex-resource-sampler".into())
-            .spawn(move || sample_loop(worker_shared, ctx))
+            .spawn(move || sample_loop(worker_shared, ctx, &codex_home))
         {
             *shared.latest.lock().unwrap() =
                 Some(error_snapshot(format!("无法启动采样线程：{error}")));
@@ -95,7 +95,6 @@ impl Monitor {
             shared,
             snapshot: None,
             selected: None,
-            selected_only: true,
         }
     }
 
@@ -119,17 +118,9 @@ impl Monitor {
         if let Some(snapshot) = self.shared.latest.lock().unwrap().take() {
             self.snapshot = Some(snapshot);
         }
-        ui.horizontal(|ui| {
-            ui.heading("会话资源");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_enabled(
-                    selected_session.is_some(),
-                    egui::Checkbox::new(&mut self.selected_only, "仅当前会话"),
-                );
-            });
-        });
+        ui.heading("进程资源");
         ui.label(
-            RichText::new("按进程启动时的会话归属统计，父会话包含子会话；共享和未归属资源另列。")
+            RichText::new("全部 Codex 及其工具进程用量；下方按会话、共享和未归属分类。")
                 .small()
                 .color(theme::MUTED),
         );
@@ -138,24 +129,7 @@ impl Monitor {
             return;
         };
         let tree = resource_tree::SessionTree::new(&snapshot.rows, sessions, selected_session);
-        let focused = self.selected_only.then_some(selected_session).flatten();
-        let usage = if focused.is_some() {
-            tree.usage(focused)
-        } else {
-            resource_tree::Usage {
-                cpu_percent: snapshot.cpu_percent,
-                memory_bytes: snapshot.memory_bytes,
-                process_count: snapshot.process_count,
-                cpu_count: snapshot.cpu_process_count,
-                memory_count: snapshot.memory_process_count,
-            }
-        };
-        summary_cards(ui, snapshot, &usage);
-        ui.small(if focused.is_some() {
-            "当前会话及子会话的已归属用量，共享资源未分摊。"
-        } else {
-            "全部 Codex 本机进程用量，不含 Profiler 自身。"
-        });
+        summary_cards(ui, snapshot);
         let attributed = snapshot
             .rows
             .iter()
@@ -163,23 +137,10 @@ impl Monitor {
             .count();
         let shared = snapshot.rows.iter().filter(|row| row.shared).count();
         ui.small(format!(
-            "全局明细：已归属 {attributed} · 共享 {shared} · 未归属 {}",
+            "明细分类：已归属 {attributed} · 共享 {shared} · 未归属 {}",
             snapshot.rows.len().saturating_sub(attributed + shared)
         ));
-        ui.label(
-            RichText::new("工作集合计（共享页可能重复计入）")
-                .small()
-                .color(theme::MUTED),
-        );
-        ui.label(RichText::new(format!(
-            "CPU 按整机 {} 个逻辑处理器归一化 · 内存比例以物理内存为分母 · 当前页每秒采样，其他页每 5 秒采样 · 本次 {:.0} ms",
-            snapshot.logical_cpus, snapshot.sample_millis
-        )).small().color(theme::MUTED));
-        ui.label(
-            RichText::new("仅能捕获采样时仍存在的进程；两次采样之间启动并结束的短任务可能遗漏。")
-                .small()
-                .color(theme::MUTED),
-        );
+        sampling_notes(ui, snapshot);
         if !snapshot.warnings.is_empty() {
             egui::CollapsingHeader::new("全局采集提示").show(ui, |ui| {
                 for warning in &snapshot.warnings {
@@ -193,7 +154,7 @@ impl Monitor {
         }
         process_details(ui, snapshot, self.selected);
         ui.separator();
-        tree.show(ui, snapshot, focused, selected_session, &mut self.selected);
+        tree.show(ui, snapshot, selected_session, &mut self.selected);
     }
 }
 
@@ -204,23 +165,24 @@ impl Drop for Monitor {
     }
 }
 
-fn summary_cards(ui: &mut egui::Ui, snapshot: &Snapshot, usage: &resource_tree::Usage) {
+/// Global cards use the full snapshot even when process details are capped or a session is selected.
+fn summary_cards(ui: &mut egui::Ui, snapshot: &Snapshot) {
     ui.columns(3, |columns| {
         let values = [
-            ("CPU · 整机占比", percent32(usage.cpu_percent)),
+            ("CPU · 整机占比", percent32(snapshot.cpu_percent)),
             (
                 "内存 · 工作集合计",
-                if usage.process_count == 0 || usage.memory_count == 0 {
+                if snapshot.process_count == 0 || snapshot.memory_process_count == 0 {
                     "未知".into()
                 } else {
                     format!(
                         "{:.1} MiB · {}",
-                        mib(usage.memory_bytes),
-                        percent(ratio(Some(usage.memory_bytes), snapshot.total_memory))
+                        mib(snapshot.memory_bytes),
+                        percent(snapshot.memory_percent)
                     )
                 },
             ),
-            ("进程数", usage.process_count.to_string()),
+            ("进程数", snapshot.process_count.to_string()),
         ];
         for (column, (title, value)) in columns.iter_mut().zip(values) {
             theme::card(theme::SURFACE).show(column, |ui| {
@@ -229,6 +191,28 @@ fn summary_cards(ui: &mut egui::Ui, snapshot: &Snapshot, usage: &resource_tree::
                 ui.label(RichText::new(value).size(21.0).strong());
             });
         }
+    });
+}
+
+/// Detailed collection limits stay available without crowding the live process tree.
+fn sampling_notes(ui: &mut egui::Ui, snapshot: &Snapshot) {
+    egui::CollapsingHeader::new("采集说明").show(ui, |ui| {
+        ui.small("不含 Profiler 自身；父会话合计包含子会话，共享进程不分摊到会话。");
+        ui.small(format!(
+            "CPU 按整机 {} 个逻辑处理器归一化；内存为工作集合计，共享页可能重复计入，比例以物理内存为分母。",
+            snapshot.logical_cpus
+        ));
+        ui.small(format!(
+            "有效读数：CPU {}/{} · 内存 {}/{}；合计仅包含有效读数。",
+            snapshot.cpu_process_count, snapshot.process_count,
+            snapshot.memory_process_count, snapshot.process_count
+        ));
+        ui.small(format!(
+            "当前页每秒采样，其他页每 5 秒采样；本次 {} ms。",
+            snapshot.sample_millis
+        ));
+        ui.small("仅能捕获采样时仍存在的进程；两次采样之间启动并结束的短任务可能遗漏。");
+        ui.small("会话归属来自已观测执行；启动前已空闲且无标识的进程可能仍未归属。");
     });
 }
 
@@ -353,8 +337,8 @@ fn error_snapshot(message: String) -> Snapshot {
 }
 
 /// A single replaceable slot bounds pending snapshots even while the page is hidden.
-fn sample_loop(shared: Arc<Shared>, ctx: egui::Context) {
-    let mut sampler = match Sampler::new() {
+fn sample_loop(shared: Arc<Shared>, ctx: egui::Context, codex_home: &Path) {
+    let mut sampler = match Sampler::new(codex_home) {
         Ok(sampler) => sampler,
         Err(error) => {
             *shared.latest.lock().unwrap() = Some(error_snapshot(error));
@@ -392,7 +376,7 @@ struct Sampler {
 }
 
 impl Sampler {
-    fn new() -> Result<Self, String> {
+    fn new(codex_home: &Path) -> Result<Self, String> {
         let mut system = System::new().map_err(|error| format!("无法读取系统进程：{error}"))?;
         system.refresh_cpu_list(CpuRefreshKind::nothing());
         Ok(Self {
@@ -400,13 +384,14 @@ impl Sampler {
             tracked: HashSet::new(),
             previous: HashSet::new(),
             last_sample: None,
-            ownership: OwnershipTracker::default(),
+            ownership: OwnershipTracker::new(codex_home),
         })
     }
 
     /// Refresh metrics normally; only newly seen Codex tool processes need a transient owner lookup.
     fn collect(&mut self) -> Snapshot {
         let began = Instant::now();
+        self.ownership.capture_activity();
         self.system
             .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
         self.system.refresh_processes_specifics(
@@ -459,6 +444,10 @@ impl Sampler {
         let mut snapshot = self.snapshot(&processes, &selected, enough_time);
         for row in &mut snapshot.rows {
             row.thread_id = bindings.get(&(row.pid, row.start_time)).cloned();
+            if row.shared && row.thread_id.is_some() {
+                row.shared = false;
+                row.scope = "REPL 内核";
+            }
         }
         if let Some(error) = self.ownership.last_error() {
             snapshot.warnings.push(format!("会话归属读取受限：{error}"));
@@ -582,6 +571,12 @@ fn root_kind(process: &ProcessInfo) -> Option<&'static str> {
     if matches!(name.as_str(), "codex" | "codex.exe") {
         return Some("Codex 核心 / CLI");
     }
+    if matches!(
+        name.as_str(),
+        "codex-code-mode-host" | "codex-code-mode-host.exe"
+    ) {
+        return Some("共享 Codex 代码执行宿主");
+    }
     let path = process
         .path
         .as_deref()
@@ -686,8 +681,8 @@ fn tree_order(
 }
 
 /// Optional headless diagnostic uses the same native sampler and warms up CPU deltas.
-pub fn sample_json() -> Result<String, String> {
-    let mut sampler = Sampler::new()?;
+pub fn sample_json(codex_home: &Path) -> Result<String, String> {
+    let mut sampler = Sampler::new(codex_home)?;
     sampler.collect();
     thread::sleep(Duration::from_secs(1));
     serde_json::to_string_pretty(&sampler.collect()).map_err(|error| error.to_string())
@@ -696,6 +691,68 @@ pub fn sample_json() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Selecting a session must keep full snapshot totals, including unreadable metrics and capped details.
+    #[test]
+    fn selected_session_keeps_global_summary_and_unknown_metrics() {
+        for (cpu, cpu_count, memory_count, expected_cpu, expected_memory) in [
+            (Some(12.5), 3, 4, "12.5%", "10.0 MiB · 25.0%"),
+            (None, 0, 0, "采样中 / 未知", "未知"),
+        ] {
+            for selected_session in [None, Some("selected")] {
+                let mut monitor = Monitor {
+                    shared: Arc::new(Shared::default()),
+                    snapshot: Some(Snapshot {
+                        rows: vec![ProcessRow {
+                            pid: 1,
+                            start_time: 1,
+                            thread_id: Some("selected".into()),
+                            cpu_percent: Some(1.0),
+                            memory_bytes: Some(1_048_576),
+                            ..ProcessRow::default()
+                        }],
+                        cpu_percent: cpu,
+                        cpu_process_count: cpu_count,
+                        memory_bytes: 10 * 1_048_576,
+                        memory_percent: Some(25.0),
+                        memory_process_count: memory_count,
+                        total_memory: 40 * 1_048_576,
+                        process_count: 7,
+                        ..Snapshot::default()
+                    }),
+                    selected: None,
+                };
+                let context = egui::Context::default();
+                let output = context.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1200.0, 900.0),
+                        )),
+                        ..egui::RawInput::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            monitor.show(ui, ctx, &[], selected_session);
+                        });
+                    },
+                );
+                let labels = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert!(labels.contains(&"进程资源"));
+                assert!(labels.contains(&expected_cpu), "{labels:?}");
+                assert!(labels.contains(&expected_memory), "{labels:?}");
+                assert!(labels.contains(&"7"), "{labels:?}");
+                assert!(!labels.iter().any(|label| label.contains("仅当前会话")));
+            }
+        }
+    }
 
     fn info(pid: u32, parent: Option<u32>, start: u64, name: &str) -> ProcessInfo {
         ProcessInfo {

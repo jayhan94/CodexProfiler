@@ -7,6 +7,7 @@ mod hook;
 mod model;
 mod pricing;
 mod process_ownership;
+mod repl_activity;
 mod resource_tree;
 mod resources;
 mod setup;
@@ -16,7 +17,7 @@ mod theme;
 mod ui;
 
 use eframe::egui;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 struct Options {
@@ -180,7 +181,7 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
     if options.mode == Mode::Resources {
-        return print_resources();
+        return print_resources(&options.codex_home);
     }
     if options.mode == Mode::Hook {
         if let Err(error) = hook::emit(&options.codex_home) {
@@ -240,8 +241,8 @@ fn main() -> eframe::Result<()> {
 }
 
 /// Read-only resource probe uses the same sampler and normalization as the resources page.
-fn print_resources() -> eframe::Result<()> {
-    match resources::sample_json() {
+fn print_resources(codex_home: &Path) -> eframe::Result<()> {
+    match resources::sample_json(codex_home) {
         Ok(snapshot) => println!("{snapshot}"),
         Err(error) => {
             eprintln!("{error}");
