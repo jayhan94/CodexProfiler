@@ -79,6 +79,16 @@ function Get-ValidatedState([string]$Destination) {
     return $state
 }
 
+# Remove only fixed, recorded shortcuts that still point to this installation.
+function Remove-ManagedShortcut([string]$RecordedPath, [string]$ExpectedPath, [string]$Executable) {
+    if (-not $RecordedPath -or $RecordedPath -ne $ExpectedPath -or
+        -not (Test-Path -LiteralPath $ExpectedPath -PathType Leaf)) { return }
+    if ((Get-Item -LiteralPath $ExpectedPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { return }
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($ExpectedPath)
+    if ($shortcut.TargetPath -eq $Executable) { Invoke-FileRemoval $ExpectedPath }
+}
+
 try {
     if (-not $InstallDir) { $InstallDir = Split-Path -Parent $PSScriptRoot }
     $InstallDir = [IO.Path]::GetFullPath($InstallDir)
@@ -100,10 +110,10 @@ try {
         }
     }
     $expectedShortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'CodexProfiler.lnk'
-    if ($state.shortcut -and $state.shortcut -eq $expectedShortcut -and (Test-Path -LiteralPath $expectedShortcut)) {
-        $shell = New-Object -ComObject WScript.Shell
-        $shortcut = $shell.CreateShortcut($expectedShortcut)
-        if ($shortcut.TargetPath -eq $executable) { Invoke-FileRemoval $expectedShortcut }
+    Remove-ManagedShortcut $state.shortcut $expectedShortcut $executable
+    if ($state.PSObject.Properties['desktop_shortcut']) {
+        $expectedDesktopShortcut = Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'CodexProfiler.lnk'
+        Remove-ManagedShortcut $state.desktop_shortcut $expectedDesktopShortcut $executable
     }
     # Keep the state until all owned files have been removed, allowing a failed attempt to be retried.
     foreach ($file in $state.files) {

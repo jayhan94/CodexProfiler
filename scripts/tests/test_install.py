@@ -172,6 +172,12 @@ class InstallerTests(unittest.TestCase):
     def test_repeat_upgrade_and_uninstall_preserve_user_files(self):
         self.assert_success(self.install())
         executable = self.install_dir / "codex-profiler.exe"
+        state_path = self.install_dir / "install-state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8-sig"))
+        self.assertIsNone(state["shortcut"])
+        self.assertIsNone(state.pop("desktop_shortcut"))
+        # Legacy schema-1 installations have no desktop field and must still upgrade.
+        state_path.write_text(json.dumps(state), encoding="utf-8")
         marker = self.codex_home / "imported-executable.txt"
         self.assertEqual(Path(marker.read_text(encoding="utf-8")), executable)
         database = self.install_dir / "profiler.sqlite3"
@@ -266,6 +272,65 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse((self.install_dir / "codex-profiler.exe").exists())
         self.assertFalse((self.install_dir / "install-state.json").exists())
         self.assertTrue((self.codex_home / "fail-import.txt").exists())
+
+    # Exercise real .lnk creation and removal in temporary folders, preserving foreign targets.
+    def test_shortcut_icons_and_owned_removal(self):
+        script = self.base / "shortcut-test.ps1"
+        script.write_text(
+            r"""
+param($SourceDir, $TemporaryDir)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+# Load only functions; never run the installer or touch the user's real desktop.
+foreach ($name in @('install.ps1', 'uninstall.ps1')) {
+    $tokens = $null
+    $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile(
+        (Join-Path $SourceDir "scripts/$name"), [ref]$tokens, [ref]$errors)
+    if ($errors.Count) { throw 'PowerShell parsing failed.' }
+    foreach ($function in $ast.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst]
+    }, $false)) {
+        . ([scriptblock]::Create($function.Extent.Text))
+    }
+}
+$executable = Join-Path $TemporaryDir 'Installed App/codex-profiler.exe'
+$configuration = Join-Path $TemporaryDir 'Codex config space'
+$shell = New-Object -ComObject WScript.Shell
+foreach ($folder in @('Programs', 'Desktop')) {
+    $directory = Join-Path $TemporaryDir $folder
+    $null = New-Item -ItemType Directory -Path $directory
+    $path = Join-Path $directory 'CodexProfiler.lnk'
+    $null = Invoke-ShortcutCreation $executable $configuration $path
+    # Upgrading refreshes the existing owned shortcut and retains the selected home.
+    $null = Invoke-ShortcutCreation $executable $configuration $path
+    $shortcut = $shell.CreateShortcut($path)
+    if ($shortcut.TargetPath -ne $executable -or
+        $shortcut.IconLocation -ne ($executable + ',0') -or
+        $shortcut.Arguments -ne ('--codex-home ' + (ConvertTo-NativeArgument $configuration))) {
+        throw 'Shortcut target, embedded icon, or configuration arguments differ.'
+    }
+    Remove-ManagedShortcut $path ($path + '.other') $executable
+    if (-not (Test-Path -LiteralPath $path)) { throw 'Removed an unapproved shortcut path.' }
+    Remove-ManagedShortcut $path $path $executable
+    if (Test-Path -LiteralPath $path) { throw 'Owned shortcut was not removed.' }
+    $foreignTarget = Join-Path $TemporaryDir 'another-application.exe'
+    $foreign = $shell.CreateShortcut($path)
+    $foreign.TargetPath = $foreignTarget
+    $foreign.Save()
+    $before = (Get-FileHash -LiteralPath $path).Hash
+    $null = Invoke-ShortcutCreation $executable $configuration $path
+    Remove-ManagedShortcut $path $path $executable
+    if (-not (Test-Path -LiteralPath $path) -or
+        (Get-FileHash -LiteralPath $path).Hash -ne $before) {
+        throw 'A same-named shortcut to another application was changed.'
+    }
+}
+""",
+            encoding="utf-8",
+        )
+        self.assert_success(run_ps(script, REPO, self.base))
 
 
 if __name__ == "__main__":

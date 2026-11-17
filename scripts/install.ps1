@@ -230,18 +230,28 @@ function Restore-Installation([string]$Destination, [string]$Backup) {
     }
 }
 
-# Keep the shortcut per-user and preserve the selected Codex configuration directory.
-function Invoke-ShortcutCreation([string]$Executable, [string]$ConfigurationDir) {
-    $programs = [Environment]::GetFolderPath('Programs')
-    $shortcutPath = Join-Path $programs 'CodexProfiler.lnk'
+# Keep shortcuts per-user, and never replace a user's same-named shortcut to another app.
+function Invoke-ShortcutCreation([string]$Executable, [string]$ConfigurationDir, [string]$ShortcutPath) {
     $shell = New-Object -ComObject WScript.Shell
-    $shortcut = $shell.CreateShortcut($shortcutPath)
+    if (Test-Path -LiteralPath $ShortcutPath) {
+        if ((Get-Item -LiteralPath $ShortcutPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            Write-Warning "Preserved an existing linked shortcut: $ShortcutPath"
+            return
+        }
+        $existing = $shell.CreateShortcut($ShortcutPath)
+        if ($existing.TargetPath -ne $Executable) {
+            Write-Warning "Preserved an existing shortcut to another application: $ShortcutPath"
+            return
+        }
+    }
+    $shortcut = $shell.CreateShortcut($ShortcutPath)
     $shortcut.TargetPath = $Executable
     $shortcut.Arguments = '--codex-home ' + (ConvertTo-NativeArgument $ConfigurationDir)
     $shortcut.WorkingDirectory = [IO.Path]::GetDirectoryName($Executable)
     $shortcut.Description = 'Codex hook timing and activity profiler'
+    $shortcut.IconLocation = $Executable + ',0'
     $shortcut.Save()
-    return $shortcutPath
+    return $ShortcutPath
 }
 
 $temporary = $null
@@ -297,17 +307,23 @@ try {
     $published = $true
     Publish-Package $staged $InstallDir
     $shortcutPath = $null
+    $desktopShortcutPath = $null
     if ($previous -and $previous.shortcut) { $shortcutPath = $previous.shortcut }
+    if ($previous -and $previous.PSObject.Properties['desktop_shortcut']) {
+        $desktopShortcutPath = $previous.desktop_shortcut
+    }
     if (-not $NoShortcut) {
         $shortcutPath = Join-Path ([Environment]::GetFolderPath('Programs')) 'CodexProfiler.lnk'
+        $desktopShortcutPath = Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'CodexProfiler.lnk'
     }
     $state = [ordered]@{
-        schema      = 1
-        application = $Application
-        version     = $manifest.version
-        files       = $PackageFiles
-        codex_home  = $CodexHome
-        shortcut    = $shortcutPath
+        schema           = 1
+        application      = $Application
+        version          = $manifest.version
+        files            = $PackageFiles
+        codex_home       = $CodexHome
+        shortcut         = $shortcutPath
+        desktop_shortcut = $desktopShortcutPath
     }
     $state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $InstallDir 'install-state.json') -Encoding UTF8
     if (-not $SkipHooks) {
@@ -316,8 +332,10 @@ try {
     }
     $committed = $true
     if (-not $NoShortcut) {
-        try { $null = Invoke-ShortcutCreation $executable $CodexHome }
-        catch { Write-Warning "Installed successfully, but could not create Start menu shortcut: $_" }
+        foreach ($path in @($shortcutPath, $desktopShortcutPath)) {
+            try { $null = Invoke-ShortcutCreation $executable $CodexHome $path }
+            catch { Write-Warning "Installed successfully, but could not create shortcut at ${path}: $_" }
+        }
     }
     Write-Information -InformationAction Continue "Installed CodexProfiler $($manifest.version) at $InstallDir"
     if (-not $SkipHooks) {
