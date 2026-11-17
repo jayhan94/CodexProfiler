@@ -401,21 +401,7 @@ fn page_tabs(ui: &mut egui::Ui, page: &mut Page) {
 
 fn brand(ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(39.0), Sense::hover());
-        ui.painter().rect(
-            rect,
-            2,
-            theme::YELLOW,
-            Stroke::new(1.0_f32, theme::BORDER),
-            egui::StrokeKind::Inside,
-        );
-        ui.painter().text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            "CP",
-            FontId::monospace(14.0),
-            theme::INK,
-        );
+        crate::branding::show(ui, 39.0);
         ui.add_space(5.0);
         ui.vertical(|ui| {
             ui.label(RichText::new("CodexProfiler").size(12.0).strong());

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+<title id="title">CodexProfiler — C and performance bars</title>
+<rect x="8" y="8" width="240" height="240" rx="32" fill="#F2CF46" stroke="#363131" stroke-width="8"/>
+<rect x="48" y="48" width="160" height="160" rx="36" fill="#363131"/>
+<rect x="76" y="76" width="132" height="104" rx="12" fill="#F2CF46"/>
+<rect x="172" y="76" width="44" height="104" rx="0" fill="#F2CF46"/>
+<rect x="100" y="128" width="20" height="36" rx="4" fill="#F2D2DD" stroke="#363131" stroke-width="6"/>
+<rect x="132" y="108" width="20" height="56" rx="4" fill="#97D4FF" stroke="#363131" stroke-width="6"/>
+<rect x="164" y="88" width="20" height="76" rx="4" fill="#FFFFFF" stroke="#363131" stroke-width="6"/>
+</svg>

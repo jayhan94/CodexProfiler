@@ -8,7 +8,6 @@ pub const INK: Color32 = Color32::from_rgb(54, 49, 49);
 pub const MUTED: Color32 = Color32::from_rgb(108, 99, 99);
 pub const PINK: Color32 = Color32::from_rgb(165, 74, 107);
 pub const PINK_SOFT: Color32 = Color32::from_rgb(242, 210, 221);
-pub const YELLOW: Color32 = Color32::from_rgb(242, 207, 70);
 pub const YELLOW_SOFT: Color32 = Color32::from_rgb(250, 232, 156);
 pub const BORDER: Color32 = Color32::from_rgb(70, 64, 64);
 // MotherDuck homepage CTA, pressed state, and dark blue for readable link text.

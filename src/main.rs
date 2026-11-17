@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod billing;
+mod branding;
 mod collector;
 mod coverage_migration;
 mod effort_backfill;
@@ -224,7 +225,8 @@ fn main() -> eframe::Result<()> {
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1120.0, 720.0])
-            .with_min_inner_size([800.0, 500.0]),
+            .with_min_inner_size([800.0, 500.0])
+            .with_icon(branding::icon()),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
